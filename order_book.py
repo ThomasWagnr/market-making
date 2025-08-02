@@ -3,49 +3,34 @@ from sortedcontainers import SortedDict
 
 class OrderBook:
     """
-    An efficient Polymarket order book that handles specific WebSocket message formats.
+    Manages the state of the order book for a single market.
     """
     def __init__(self, market_id: str):
         self.market_id = market_id
         self.bids = SortedDict()
         self.asks = SortedDict()
 
-    def process_message(self, message_json: str):
-        """Processes a raw JSON message from the WebSocket."""
-        data = orjson.loads(message_json)
-        
-        if data.get("market") != self.market_id:
-            return
-
-        event_type = data.get("event_type")
-
-        if event_type == "book":
-            self._handle_snapshot(data)
-        elif event_type == "price_change":
-            self._handle_price_change(data)
-
-    def _handle_snapshot(self, data: dict):
-        """Rebuilds the order book from a full snapshot ('book' event)."""
+    def update_from_snapshot(self, data: dict):
+        """
+        Rebuilds the order book from a full snapshot ('book' event).
+        """
         self.bids.clear()
         self.asks.clear()
 
         for level in data.get('bids', []):
-            price = float(level['price'])
-            size = float(level['size'])
-            if size > 0:
-                self.bids[-price] = size
+            price, size = float(level['price']), float(level['size'])
+            if size > 0: self.bids[-price] = size
 
         for level in data.get('asks', []):
-            price = float(level['price'])
-            size = float(level['size'])
-            if size > 0:
-                self.asks[price] = size
+            price, size = float(level['price']), float(level['size'])
+            if size > 0: self.asks[price] = size
 
-    def _handle_price_change(self, data: dict):
-        """Processes delta updates from a 'price_change' event."""
+    def update_from_price_change(self, data: dict):
+        """
+        Updates the book from a 'price_change' event.
+        """
         for change in data.get('changes', []):
-            price = float(change['price'])
-            size = float(change['size'])
+            price, size = float(change['price']), float(change['size'])
             side = change['side'].upper()
 
             book = self.bids if side == 'BUY' else self.asks
@@ -58,28 +43,37 @@ class OrderBook:
 
     @property
     def best_bid(self) -> float | None:
-        """Returns the best bid price (highest price)."""
+        """
+        Returns the best bid price (highest price).
+        """
         if not self.bids:
             return None
         return -self.bids.peekitem(0)[0] 
 
     @property
     def best_ask(self) -> float | None:
-        """Returns the best ask price (lowest price)."""
+        """
+        Returns the best ask price (lowest price).
+        """
         if not self.asks:
             return None
         return self.asks.peekitem(0)[0]
 
-    def get_spread(self) -> float | None:
-        """Returns the difference between the best ask and best bid."""
+    @property
+    def spread(self) -> float | None:
+        """
+        Returns the difference between the best ask and best bid.
+        """
         bid, ask = self.best_bid, self.best_ask
         return ask - bid if bid is not None and ask is not None else None
 
     def __str__(self):
-        """Provides a clean, single-line string representation of the book's state."""
+        """
+        Provides a clean, single-line string representation of the book's state.
+        """
         bid_str = f"{self.best_bid:.2f}" if self.best_bid is not None else "N/A"
         ask_str = f"{self.best_ask:.2f}" if self.best_ask is not None else "N/A"
-        spread = self.get_spread()
+        spread = self.spread
         spread_str = f"{spread:.4f}" if spread is not None else "N/A"
         
         return f"Book State | Bid: {bid_str} | Ask: {ask_str} | Spread: {spread_str}"
