@@ -1,0 +1,20 @@
+# Core data science and analysis
+numpy==2.0.2
+pandas==2.3.1
+matplotlib
+
+# HTTP and WebSocket libraries
+requests==2.32.4
+aiohttp==3.12.15
+websockets==13.1
+
+# JSON and data structures
+orjson
+sortedcontainers
+
+# Date and time utilities
+python-dateutil==2.9.0.post0
+pytz==2025.2
+
+# Environment and configuration
+python-dotenv==1.1.1
