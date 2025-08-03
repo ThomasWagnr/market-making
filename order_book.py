@@ -60,6 +60,14 @@ class OrderBook:
         return self.asks.peekitem(0)[0]
 
     @property
+    def mid_price(self) -> float | None:
+        """
+        Returns the mid price (average of the best bid and ask).
+        """
+        bid, ask = self.best_bid, self.best_ask
+        return (bid + ask) / 2 if bid is not None and ask is not None else None
+
+    @property
     def spread(self) -> float | None:
         """
         Returns the difference between the best ask and best bid.
@@ -73,7 +81,9 @@ class OrderBook:
         """
         bid_str = f"{self.best_bid:.2f}" if self.best_bid is not None else "N/A"
         ask_str = f"{self.best_ask:.2f}" if self.best_ask is not None else "N/A"
+        mid_price = self.mid_price
+        mid_price_str = f"{mid_price:.2f}" if mid_price is not None else "N/A"
         spread = self.spread
         spread_str = f"{spread:.4f}" if spread is not None else "N/A"
         
-        return f"Book State | Bid: {bid_str} | Ask: {ask_str} | Spread: {spread_str}"
+        return f"Book State | Best Bid: {bid_str} | Best Ask: {ask_str} | Mid Price: {mid_price_str} | Spread: {spread_str}"
