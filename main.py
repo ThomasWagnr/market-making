@@ -2,6 +2,7 @@ import asyncio
 import sys
 import logging
 from market_maker_bot import MarketMakerBot
+from strategies.avellaneda_stoikov import AvellanedaStoikovStrategy
 
 def main():
     """
@@ -20,11 +21,17 @@ def main():
 
     market_id = sys.argv[1]
 
-    # --- Bot Configuration ---
+    # --- 1. Choose and Configure the Strategy ---
+    strategy = AvellanedaStoikovStrategy(
+        gamma=0.1,
+        lookback_period=100
+    )
+
+    # --- 2. Configure the Bot with the Chosen Strategy ---
     bot = MarketMakerBot(
         market_id=market_id,
-        order_size=10.0,
-        desired_spread=0.02
+        strategy=strategy,
+        lot_size=10.0
     )
 
     try:
