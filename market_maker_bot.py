@@ -3,11 +3,13 @@ import json
 import logging
 import aiohttp
 import websockets
+from datetime import datetime, timezone
+from typing import Optional
 
 from order_book import OrderBook
 from trade_history import TradeHistory
 from event_dispatcher import EventDispatcher
-from utils import get_yes_token_for_market
+from utils import get_yes_token_for_market, get_market_close_time
 from strategies.base_strategy import BaseStrategy
 
 logger = logging.getLogger(__name__)
@@ -27,9 +29,14 @@ class MarketMakerBot:
 
         # --- Live State ---
         self.inventory_position = 0.0
-        self.time_horizon = 1.0  # Represents the fraction of the trading session remaining
         self.active_bid = {'id': None, 'price': 0.0, 'size': 0.0}
         self.active_ask = {'id': None, 'price': 0.0, 'size': 0.0}
+
+        # --- Market State ---
+        self.time_horizon = 1.0
+        self.market_start_time: Optional[datetime] = None
+        self.market_close_time: Optional[datetime] = None
+        self.session_duration_seconds: float = 0.0
 
         # --- Component Initialization ---
         self.order_book = OrderBook(self.market_id)
@@ -152,22 +159,44 @@ class MarketMakerBot:
             self._cancel_order(self.active_ask['id'])
 
     async def _decrement_time(self):
-        """Simulates the passage of time for the strategy's T parameter."""
-        # To-Do: Link this to the market's closing time.
-        session_duration_seconds = 300 # e.g., a 5-minute session
+        """Dynamically calculates the time horizon based on the market's actual close time."""
+        if not self.market_start_time or not self.market_close_time or self.session_duration_seconds <= 0:
+            logger.error("Cannot start time decrement task: market times not initialized.")
+            return
+
+        logger.info("Time horizon tracking started.")
         while self.time_horizon > 0 and self.is_running:
-            await asyncio.sleep(1)
-            self.time_horizon = max(0, self.time_horizon - (1 / session_duration_seconds))
+            now = datetime.now(timezone.utc)
+            time_remaining = (self.market_close_time - now).total_seconds()
+            self.time_horizon = max(0, time_remaining / self.session_duration_seconds)
+            await asyncio.sleep(1) # Update every second
+        
+        logger.info("Time horizon reached zero. Market has likely closed.")
 
     async def run(self):
         """The main run loop that connects to the WebSocket and processes messages."""
         logger.info("Starting bot for market: %s", self.market_id)
 
         async with aiohttp.ClientSession() as session:
-            yes_token_id = await get_yes_token_for_market(session, self.market_id)
-            if not yes_token_id:
-                logger.critical("Could not get token for market %s. Shutting down.", self.market_id)
+            # --- Fetch market info on startup ---
+            yes_token_id, close_time = await asyncio.gather(
+                get_yes_token_for_market(session, self.market_id),
+                get_market_close_time(session, self.market_id)
+            )
+
+            if not yes_token_id or not close_time:
+                logger.critical("Failed to get market token or close time. Shutting down.")
                 return
+
+            self.market_close_time = close_time
+            self.market_start_time = datetime.now(timezone.utc)
+            self.session_duration_seconds = \
+                (self.market_close_time - self.market_start_time).total_seconds()
+
+            if self.session_duration_seconds <= 0:
+                logger.critical("Market has already closed. Shutting down.")
+                return
+            # --- End startup fetching ---
 
             # Start the background task to decrement the time horizon
             asyncio.create_task(self._decrement_time())
