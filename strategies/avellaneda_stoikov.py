@@ -19,15 +19,17 @@ class AvellanedaStoikovStrategy(BaseStrategy):
         self.trend_skew = trend_skew
         self.ewma_span = ewma_span
         self.mid_price_history = deque(maxlen=lookback_period)
-        self.volatility = 0.0
 
-    def _estimate_liquidity(self, order_book: OrderBook, mid_price: float) -> float:
+    def _estimate_liquidity(self, order_book: OrderBook) -> float:
         """Estimates the liquidity parameter 'k' from the order book depth."""
-        # Look at orders within 2% of the mid-price
-        price_range = mid_price * 0.02
         
-        bid_volume_in_range = sum(size for price, size in order_book.bids.items() 
-                                if mid_price - price <= price_range)
+        mid_price = order_book.mid_price
+        market_spread = order_book.spread
+        base_range = mid_price * 0.02
+        price_range = max(base_range, market_spread)
+
+        bid_volume_in_range = sum(size for price, size in order_book.bids.items()
+                                if mid_price - (-price) <= price_range) # Note: price is negative key
         ask_volume_in_range = sum(size for price, size in order_book.asks.items() 
                                 if price - mid_price <= price_range)
         
@@ -50,38 +52,57 @@ class AvellanedaStoikovStrategy(BaseStrategy):
         max_skew = 0.005 # Cap the skew at half a cent
         
         return np.clip(slope, -max_skew, max_skew)
+
+    def _get_calm_market_quotes(self, order_book: OrderBook) -> tuple[float, float]:
+        """
+        Calculates quotes for a calm market using a hybrid approach.
+        It respects a minimum spread while trying to improve on the market price.
+        """
+        mid_price = order_book.mid_price
+        
+        minimum_spread = 2 * TICK_SIZE
+        ideal_bid = mid_price - (minimum_spread / 2)
+        ideal_ask = mid_price + (minimum_spread / 2)
+
+        opportunistic_bid = order_book.best_bid + TICK_SIZE
+        opportunistic_ask = order_book.best_ask - TICK_SIZE
+
+        final_bid = max(ideal_bid, opportunistic_bid)
+        final_ask = min(ideal_ask, opportunistic_ask)
+        
+        if final_bid >= final_ask:
+            return self._round_to_tick(ideal_bid), self._round_to_tick(ideal_ask)
+
+        return self._round_to_tick(final_bid), self._round_to_tick(final_ask)
     
     def calculate_quotes(self, order_book: OrderBook, inventory_position: float, time_horizon: float) -> tuple[float | None, float | None]:
-        best_bid = order_book.best_bid
-        best_ask = order_book.best_ask
-
-        if best_bid is None or best_ask is None:
+        mid_price = order_book.mid_price
+        if mid_price is None:
             return None, None
 
-        mid_price = order_book.mid_price
         self.mid_price_history.append(mid_price)
 
         if len(self.mid_price_history) < self.lookback_period:
             logger.info(f"Strategy warming up. Data collected: {len(self.mid_price_history)}/{self.lookback_period}")
             return None, None
 
-        k = self._estimate_liquidity(order_book, mid_price)
-
         price_series = pd.Series(list(self.mid_price_history))
         price_changes = price_series.diff().dropna()
-        # Calculate the exponentially weighted standard deviation of price changes
-        self.volatility = price_changes.ewm(span=self.ewma_span).std().iloc[-1]
-        #self.volatility = np.std(list(self.mid_price_history))
-        if self.volatility == 0:
-            return None, None
+        measured_volatility = price_changes.ewm(span=self.ewma_span).std().iloc[-1]
+        effective_volatility = max(measured_volatility, 0.0001) if pd.notna(measured_volatility) else 0.0001
+
+        #if self.volatility == 0 or pd.isna(self.volatility):
+        #    logger.info("Zero volatility detected. Using hybrid calm market quotes.")
+        #    return self._get_calm_market_quotes(order_book)
+
+        k = self._estimate_liquidity(order_book)
 
         skew = self._calculate_trend_skew() if self.trend_skew else 0.0
-
-        inventory_term = inventory_position * self.gamma * self.volatility**2 * time_horizon
+        inventory_term = inventory_position * self.gamma * effective_volatility**2 * time_horizon
         reservation_price = mid_price - inventory_term + skew
 
         liquidity_term = math.log(1 + self.gamma / k)
-        spread = self.gamma * self.volatility**2 * time_horizon + (2 / self.gamma) * liquidity_term
+        spread = self.gamma * effective_volatility**2 * time_horizon + (2 / self.gamma) * liquidity_term
 
         our_bid = self._round_to_tick(reservation_price - (spread / 2))
         our_ask = self._round_to_tick(reservation_price + (spread / 2))
