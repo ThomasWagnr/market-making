@@ -24,11 +24,9 @@ class ExecutionClient(ABC):
 class DryRunExecutionClient(ExecutionClient):
     """A simulated execution client that tracks order state and logs actions."""
     
-    def __init__(self, orders_list: List[Dict[str, Any]], fills_list: List[Dict[str, Any]]):
+    def __init__(self, orders_list: List[Dict[str, Any]]):
         self.order_id_generator = itertools.count(1)
-        self.simulated_orders_log = orders_list 
-        self.simulated_fills_log = fills_list   
-        
+        self.simulated_orders_log = orders_list
         self.active_orders: Dict[int, Dict[str, Any]] = {}
 
     def place_order(self, side: str, price: float, size: float) -> int | None:
