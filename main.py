@@ -2,13 +2,30 @@ import asyncio
 import sys
 import logging
 import os
+import csv
 from datetime import datetime
+from typing import List, Dict, Any
 
 from market_maker_bot import MarketMakerBot
 from strategies.avellaneda_stoikov import AvellanedaStoikovStrategy
 from execution_client import DryRunExecutionClient
 
 logger = logging.getLogger(__name__)
+
+def save_report_to_csv(filename: str, data: List[Dict[str, Any]]):
+    """Saves a list of dictionaries to a CSV file."""
+    if not data:
+        logger.info(f"No data to save for {filename}.")
+        return
+        
+    try:
+        with open(filename, 'w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=data[0].keys())
+            writer.writeheader()
+            writer.writerows(data)
+        logger.info(f"Successfully saved report to {filename}")
+    except Exception as e:
+        logger.error(f"Failed to save report to {filename}: {e}", exc_info=True)
 
 def main():
     """
@@ -27,7 +44,6 @@ def main():
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     log_filename = os.path.join(log_dir, f"bot_run_{market_id}_{timestamp}.log")
 
-    # --- Configure logging to output to both console and file ---
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s - %(name)-24s - %(levelname)-8s - %(message)s',
@@ -53,8 +69,7 @@ def main():
     simulated_fills_list = []
 
     execution_client = DryRunExecutionClient(
-        orders_list=simulated_orders_list,
-        fills_list=simulated_fills_list
+        orders_list=simulated_orders_list
     )
 
     bot = MarketMakerBot(
@@ -62,7 +77,6 @@ def main():
         strategy=strategy,
         execution_client=execution_client,
         base_order_size=100.0,
-        simulated_orders=simulated_orders_list, # Pass lists for reporting
         simulated_fills=simulated_fills_list
     )
 
@@ -73,8 +87,13 @@ def main():
         logger.info("Shutdown signal received by user.")
     finally:
         logger.info("Initiating graceful shutdown...")
-        # The bot's own shutdown method handles liquidation and saving reports
         asyncio.run(bot.shutdown())
+
+        logger.info("Saving final reports...")
+        save_report_to_csv('simulated_orders.csv', simulated_orders_list)
+        save_report_to_csv('simulated_fills.csv', bot.simulated_fills)
+        save_report_to_csv('trade_history.csv', bot.trade_history.trade_log)
+
         logger.info("Bot shutdown complete.")
 
 if __name__ == "__main__":
