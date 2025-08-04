@@ -79,10 +79,10 @@ class OrderBook:
         """
         Provides a clean, single-line string representation of the book's state.
         """
-        bid_str = f"{self.best_bid:.2f}" if self.best_bid is not None else "N/A"
-        ask_str = f"{self.best_ask:.2f}" if self.best_ask is not None else "N/A"
+        bid_str = f"{self.best_bid:.3f}" if self.best_bid is not None else "N/A"
+        ask_str = f"{self.best_ask:.3f}" if self.best_ask is not None else "N/A"
         mid_price = self.mid_price
-        mid_price_str = f"{mid_price:.2f}" if mid_price is not None else "N/A"
+        mid_price_str = f"{mid_price:.3f}" if mid_price is not None else "N/A"
         spread = self.spread
         spread_str = f"{spread:.4f}" if spread is not None else "N/A"
         
