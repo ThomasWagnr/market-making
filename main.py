@@ -38,7 +38,8 @@ def main():
     # --- 1. Choose and Configure the Strategy ---
     strategy = AvellanedaStoikovStrategy(
         gamma=0.1,
-        lookback_period=100
+        lookback_period=100,
+        trend_skew=True
     )
 
     # --- 2. Configure the Bot with the Chosen Strategy ---

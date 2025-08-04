@@ -65,7 +65,7 @@ class OrderBook:
         Returns the mid price (average of the best bid and ask).
         """
         bid, ask = self.best_bid, self.best_ask
-        return (bid + ask) / 2 if bid is not None and ask is not None else None
+        return (bid + ask) / 2.0 if bid is not None and ask is not None else None
 
     @property
     def spread(self) -> float | None:
