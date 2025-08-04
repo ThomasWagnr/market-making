@@ -1,6 +1,8 @@
 import math
 import numpy as np
+import pandas as pd
 from collections import deque
+from scipy.stats import linregress
 from .base_strategy import BaseStrategy
 from order_book import OrderBook
 import logging
@@ -11,10 +13,11 @@ TICK_SIZE = 0.001
 class AvellanedaStoikovStrategy(BaseStrategy):
     """Implements the Avellaneda-Stoikov market making model."""
 
-    def __init__(self, gamma: float = 0.1, lookback_period: int = 100, trend_skew: bool = True):
+    def __init__(self, gamma: float = 10, lookback_period: int = 100, ewma_span: int = 20, trend_skew: bool = True):
         self.gamma = gamma
         self.lookback_period = lookback_period
         self.trend_skew = trend_skew
+        self.ewma_span = ewma_span
         self.mid_price_history = deque(maxlen=lookback_period)
         self.volatility = 0.0
 
@@ -33,6 +36,20 @@ class AvellanedaStoikovStrategy(BaseStrategy):
         
         # We can cap or scale k to keep it within a reasonable range
         return max(1.0, k / 1000) # Scale down the raw volume
+
+    def _calculate_trend_skew(self) -> float:
+        """Calculates trend by fitting a regression line to recent mid-prices."""
+        trend_window = 20
+        if len(self.mid_price_history) < trend_window:
+            return 0.0
+        
+        recent_prices = list(self.mid_price_history)[-trend_window:]
+        time_steps = np.arange(trend_window)
+        regression = linregress(time_steps, recent_prices)
+        slope = regression.slope
+        max_skew = 0.005 # Cap the skew at half a cent
+        
+        return np.clip(slope, -max_skew, max_skew)
     
     def calculate_quotes(self, order_book: OrderBook, inventory_position: float, time_horizon: float) -> tuple[float | None, float | None]:
         best_bid = order_book.best_bid
@@ -49,18 +66,16 @@ class AvellanedaStoikovStrategy(BaseStrategy):
             return None, None
 
         k = self._estimate_liquidity(order_book, mid_price)
-         
-        self.volatility = np.std(list(self.mid_price_history))
+
+        price_series = pd.Series(list(self.mid_price_history))
+        price_changes = price_series.diff().dropna()
+        # Calculate the exponentially weighted standard deviation of price changes
+        self.volatility = price_changes.ewm(span=self.ewma_span).std().iloc[-1]
+        #self.volatility = np.std(list(self.mid_price_history))
         if self.volatility == 0:
             return None, None
 
-        skew = 0.0
-        if self.trend_skew:
-            if len(self.mid_price_history) > 20:
-                long_term_price = self.mid_price_history[-20]
-                short_term_price = self.mid_price_history[-1]
-                # The skew will be a small positive number for an uptrend, negative for a downtrend
-                skew = short_term_price - long_term_price
+        skew = self._calculate_trend_skew() if self.trend_skew else 0.0
 
         inventory_term = inventory_position * self.gamma * self.volatility**2 * time_horizon
         reservation_price = mid_price - inventory_term + skew

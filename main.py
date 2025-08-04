@@ -37,8 +37,9 @@ def main():
 
     # --- 1. Choose and Configure the Strategy ---
     strategy = AvellanedaStoikovStrategy(
-        gamma=0.1,
-        lookback_period=100,
+        gamma=10.0,
+        lookback_period=20,
+        ewma_span=20,
         trend_skew=True
     )
 
