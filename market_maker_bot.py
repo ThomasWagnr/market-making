@@ -1,8 +1,10 @@
 import asyncio
 import json
 import logging
+import itertools 
 import aiohttp
 import websockets
+import csv
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -20,13 +22,28 @@ POSITION_LIMIT = 500.0
 class MarketMakerBot:
     """A generic bot runner that operates using a provided strategy module."""
 
-    def __init__(self, market_id: str, strategy: BaseStrategy, lot_size: float = 10.0):
+    def __init__(self, market_id: str, strategy: BaseStrategy, lot_size: float = 10.0, dry_run: bool = True):
         # --- Configuration ---
         self.market_id = market_id
         self.strategy = strategy
         self.lot_size = lot_size
+        self.dry_run = dry_run
         self.is_running = True
 
+        # --- Reporting & Simulation ---
+        self.simulated_orders = []
+        self.simulated_fills = []
+        self.order_id_generator = itertools.count(1)
+
+        if self.dry_run:
+            logger.warning("Bot is running in DRY RUN mode. No real orders will be placed.")
+
+        # --- Performance Tracking State ---
+        self.realized_pnl = 0.0
+        self.unrealized_pnl = 0.0
+        self.cash = 10000.0
+        self.average_entry_price = 0.0
+        
         # --- Live State ---
         self.inventory_position = 0.0
         self.active_bid = {'id': None, 'price': 0.0, 'size': 0.0}
@@ -49,9 +66,10 @@ class MarketMakerBot:
 
     def _on_update(self, event_type: str, data: dict):
         """Core trigger, called by the dispatcher after any data update."""
-        # 1. Check for potential fills from the last trade
         if event_type == "last_trade_price":
             self._check_fills(data)
+
+        self._update_pnl()
 
         # 2. Delegate quote calculation to the strategy module
         new_bid, new_ask = self.strategy.calculate_quotes(
@@ -61,7 +79,8 @@ class MarketMakerBot:
         )
 
         # 3. Print current state to the console
-        state_str = f"{self.order_book} | {self.trade_history} | Inv: {self.inventory_position:+.1f}"
+        state_str = (f"{self.order_book} | Inv: {self.inventory_position:+.1f} | "
+                     f"P&L: ${self.realized_pnl:+.2f} | Equity: ${self.total_value:,.2f}")
         print(f"\r{state_str}", end="", flush=True)
 
         # 4. Update orders on the exchange based on the strategy's decision
@@ -69,6 +88,26 @@ class MarketMakerBot:
             self._update_orders(new_bid, new_ask)
         else:
             self._cancel_all_orders()
+
+    def _update_pnl(self):
+        """Calculates unrealized P&L and total equity."""
+        if not self.order_book.best_bid or not self.order_book.best_ask:
+            return
+
+        mid_price = (self.order_book.best_bid + self.order_book.best_ask) / 2
+        
+        # Calculate the market value of our current inventory
+        market_value = self.inventory_position * mid_price
+        
+        # Calculate unrealized P&L if we hold a position
+        if self.inventory_position != 0:
+            cost_basis = self.inventory_position * self.average_entry_price
+            self.unrealized_pnl = market_value - cost_basis
+        else:
+            self.unrealized_pnl = 0.0
+        
+        # Total equity is our cash plus the current market value of our assets
+        self.total_value = self.cash + market_value
 
     def _update_orders(self, new_bid: float, new_ask: float):
         """Manages order cancellations and placements to match the strategy's target."""
@@ -95,61 +134,108 @@ class MarketMakerBot:
                 self.active_ask = {'id': order_id, 'price': new_ask, 'size': self.lot_size}
 
     def _check_fills(self, trade: dict):
-        """Checks for fills and updates the inventory position."""
+        """Checks for fills and updates inventory, cash, and P&L."""
         trade_price = float(trade['price'])
         trade_size = float(trade['size'])
 
+        side = None
+        fill_amount = 0.0
+
         # Check for a bid fill
         if self.active_bid['id'] and trade_price == self.active_bid['price']:
-            # Determine the actual amount filled in this trade
+            side = 'BUY'
             fill_amount = min(trade_size, self.active_bid['size'])
             is_full_fill = (self.active_bid['size'] - fill_amount) <= 1e-9
 
-            # Log the specific outcome
-            if is_full_fill:
-                logger.info(f"Our BID was FULLY filled! Amount: {fill_amount} at {trade_price:.3f}")
-            else:
-                logger.info(f"Our BID was PARTIALLY filled! Amount: {fill_amount} at {trade_price:.3f}")
-
-            # Update state
-            self.inventory_position += fill_amount
             self.active_bid['size'] -= fill_amount
-
-            # Reset the order if it's now fully filled
             if is_full_fill:
                 self.active_bid = {'id': None, 'price': 0.0, 'size': 0.0}
-
-        # Check for an ask fill
+        
         elif self.active_ask['id'] and trade_price == self.active_ask['price']:
-            # Determine the actual amount filled in this trade
+            side = 'SELL'
             fill_amount = min(trade_size, self.active_ask['size'])
             is_full_fill = (self.active_ask['size'] - fill_amount) <= 1e-9
-
-            # Log the specific outcome
-            if is_full_fill:
-                logger.info(f"Our ASK was FULLY filled! Amount: {fill_amount} at {trade_price:.3f}")
-            else:
-                logger.info(f"Our ASK was PARTIALLY filled! Amount: {fill_amount} at {trade_price:.3f}")
-
-            # Update state
-            self.inventory_position -= fill_amount
+            
             self.active_ask['size'] -= fill_amount
-
-            # Reset the order if it's now fully filled
             if is_full_fill:
                 self.active_ask = {'id': None, 'price': 0.0, 'size': 0.0}
+        
+        if side:
+            self.simulated_fills.append({
+                'timestamp': datetime.now(timezone.utc).isoformat(),
+                'side': side, 'price': trade_price, 'size': fill_amount
+            })
 
-    def _place_order(self, side: str, price: float, size: float) -> int:
-        """Placeholder for order placement logic. Returns a dummy ID."""
-        order_id = abs(hash(f"{side}{price}{size}{asyncio.run(asyncio.sleep(0))}"))
-        logger.info(f"PLACING {side} order for {size} @ {price:.3f} (ID: {order_id})")
-        # To-Do: Implement order placement logic
-        return order_id
+            # Update cash and inventory position
+            if side == 'BUY':
+                # --- Update Average Entry Price ---
+                # If reducing a short position, realize P&L
+                if self.inventory_position < 0:
+                    self.realized_pnl += (self.average_entry_price - trade_price) * fill_amount
+                # If opening or adding to a long position, update avg price
+                else: 
+                    new_total_cost = (self.average_entry_price * self.inventory_position) + (trade_price * fill_amount)
+                    self.average_entry_price = new_total_cost / (self.inventory_position + fill_amount)
+                
+                self.inventory_position += fill_amount
+                self.cash -= fill_amount * trade_price
+
+            else: # SELL
+                # --- Update Average Entry Price ---
+                # If reducing a long position, realize P&L
+                if self.inventory_position > 0:
+                    self.realized_pnl += (trade_price - self.average_entry_price) * fill_amount
+                # If opening or adding to a short position, update avg price
+                else:
+                    new_total_cost = (self.average_entry_price * abs(self.inventory_position)) + (trade_price * fill_amount)
+                    self.average_entry_price = new_total_cost / (abs(self.inventory_position) + fill_amount)
+                
+                self.inventory_position -= fill_amount
+                self.cash += fill_amount * trade_price
+
+            # Reset average entry price if position is now flat
+            if abs(self.inventory_position) < 1e-9:
+                self.average_entry_price = 0.0
+
+            logger.info(f"FILL: {side} {fill_amount} @ {trade_price:.3f}. New Inventory: {self.inventory_position:+.1f}")
+
+    def _place_order(self, side: str, price: float, size: float) -> int | None:
+        """Records the intent to place an order and simulates or executes it."""
+        order_id = next(self.order_id_generator)
+
+        order_record = {
+            'timestamp': datetime.now(timezone.utc).isoformat(),
+            'action': 'PLACE',
+            'order_id': order_id,
+            'side': side,
+            'price': price,
+            'size': size
+        }
+        self.simulated_orders.append(order_record)
+
+        if self.dry_run:
+            logger.info(f"[DRY RUN] PLACING {side} order for {size} @ {price:.3f} (Simulated ID: {order_id})")
+            return order_id
+        else:
+            # To-Do: Implement REAL order placement logic here.
+            # The real exchange-provided order ID should be returned.
+            logger.error("LIVE TRADING NOT IMPLEMENTED")
+            return None
 
     def _cancel_order(self, order_id: int):
-        """Placeholder for canceling an order."""
-        logger.info(f"CANCELING order {order_id}")
-        # To-Do: Implement order cancellation logic
+        """Records the intent to cancel an order and simulates or executes it."""
+        order_record = {
+            'timestamp': datetime.now(timezone.utc).isoformat(),
+            'action': 'CANCEL',
+            'order_id': order_id
+        }
+        self.simulated_orders.append(order_record)
+
+        if self.dry_run:
+            logger.info(f"[DRY RUN] CANCELING order {order_id}")
+        else:
+            # To-Do: Implement REAL order cancellation logic here.
+            logger.error("LIVE TRADING NOT IMPLEMENTED")
 
     def _cancel_all_orders(self):
         """Cancels all currently active orders."""
@@ -224,3 +310,23 @@ class MarketMakerBot:
         """Signals the bot to gracefully shut down."""
         logger.info("Stop signal received. Shutting down bot for market %s...", self.market_id)
         self.is_running = False
+
+    def save_report(self):
+        """Saves the simulated orders and fills to CSV files."""
+        logger.info("Saving simulation report to CSV files...")
+        
+        # Save orders
+        if self.simulated_orders:
+            with open('simulated_orders.csv', 'w', newline='') as f:
+                writer = csv.DictWriter(f, fieldnames=self.simulated_orders[0].keys())
+                writer.writeheader()
+                writer.writerows(self.simulated_orders)
+            logger.info("Saved simulated_orders.csv")
+
+        # Save fills
+        if self.simulated_fills:
+            with open('simulated_fills.csv', 'w', newline='') as f:
+                writer = csv.DictWriter(f, fieldnames=self.simulated_fills[0].keys())
+                writer.writeheader()
+                writer.writerows(self.simulated_fills)
+            logger.info("Saved simulated_fills.csv")
