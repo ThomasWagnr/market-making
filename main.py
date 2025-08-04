@@ -3,8 +3,12 @@ import sys
 import logging
 import os
 from datetime import datetime
+
 from market_maker_bot import MarketMakerBot
 from strategies.avellaneda_stoikov import AvellanedaStoikovStrategy
+from execution_client import DryRunExecutionClient
+
+logger = logging.getLogger(__name__)
 
 def main():
     """
@@ -14,12 +18,14 @@ def main():
         print("Usage: python main.py <market_id>")
         sys.exit(1)
 
+    market_id = sys.argv[1]
+
     log_dir = 'logs'
     if not os.path.exists(log_dir):
         os.makedirs(log_dir)
 
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    log_filename = f"{log_dir}/bot_run_{timestamp}.log"
+    log_filename = os.path.join(log_dir, f"bot_run_{market_id}_{timestamp}.log")
 
     # --- Configure logging to output to both console and file ---
     logging.basicConfig(
@@ -33,32 +39,43 @@ def main():
     )
     logging.getLogger('websockets').setLevel(logging.WARNING)
 
-    market_id = sys.argv[1]
-
     # --- 1. Choose and Configure the Strategy ---
     strategy = AvellanedaStoikovStrategy(
         gamma=10.0,
         lookback_period=20,
         ewma_span=20,
-        trend_skew=True
+        trend_skew=True,
+        k_scaling_factor=10.0,
+        max_skew=0.005
     )
 
-    # --- 2. Configure the Bot with the Chosen Strategy ---
+    simulated_orders_list = []
+    simulated_fills_list = []
+
+    execution_client = DryRunExecutionClient(
+        orders_list=simulated_orders_list,
+        fills_list=simulated_fills_list
+    )
+
     bot = MarketMakerBot(
         market_id=market_id,
         strategy=strategy,
-        risk_fraction=0.1,
-        dry_run=True
+        execution_client=execution_client,
+        base_order_size=100.0,
+        simulated_orders=simulated_orders_list, # Pass lists for reporting
+        simulated_fills=simulated_fills_list
     )
 
     try:
+        logger.info("Starting bot run...")
         asyncio.run(bot.run())
     except KeyboardInterrupt:
-        print("\nBot stopped manually.")
+        logger.info("Shutdown signal received by user.")
     finally:
-        bot.stop()
-        bot.save_report()
-        print("Bot shutdown gracefully.")
+        logger.info("Initiating graceful shutdown...")
+        # The bot's own shutdown method handles liquidation and saving reports
+        asyncio.run(bot.shutdown())
+        logger.info("Bot shutdown complete.")
 
 if __name__ == "__main__":
     main()
