@@ -13,67 +13,81 @@ TICK_SIZE = 0.001
 class AvellanedaStoikovStrategy(BaseStrategy):
     """Implements the Avellaneda-Stoikov market making model."""
 
-    def __init__(self, gamma: float = 10, lookback_period: int = 100, ewma_span: int = 20, trend_skew: bool = True):
+    def __init__(self, 
+                gamma: float = 10, 
+                lookback_period: int = 100, 
+                ewma_span: int = 20, 
+                trend_skew: bool = True,
+                trend_window: int = 20,
+                max_skew: float = 0.005,
+                k_scaling_factor: float = 10.0):
+
         self.gamma = gamma
         self.lookback_period = lookback_period
         self.trend_skew = trend_skew
         self.ewma_span = ewma_span
+        self.trend_window = trend_window
+        self.max_skew = max_skew
+        self.k_scaling_factor = k_scaling_factor
         self.mid_price_history = deque(maxlen=lookback_period)
 
     def _estimate_liquidity(self, order_book: OrderBook) -> float:
-        """Estimates the liquidity parameter 'k' from the order book depth."""
-        
-        mid_price = order_book.mid_price
-        market_spread = order_book.spread
-        base_range = mid_price * 0.02
-        price_range = max(base_range, market_spread)
+        """
+        Estimates the liquidity parameter 'k' by calculating the
+        Volume-Weighted Average Spread (VWAS) of the top book levels.
+        """
 
-        bid_volume_in_range = sum(size for price, size in order_book.bids.items()
-                                if mid_price - (-price) <= price_range) # Note: price is negative key
-        ask_volume_in_range = sum(size for price, size in order_book.asks.items() 
-                                if price - mid_price <= price_range)
-        
-        # Simple estimation for k (volume per unit of price)
-        k = (bid_volume_in_range + ask_volume_in_range) / (2 * price_range + 1e-9)
-        
-        # We can cap or scale k to keep it within a reasonable range
-        return max(1.0, k / 1000) # Scale down the raw volume
+        mid_price = order_book.mid_price
+
+        # --- VWAS Calculation ---
+        total_bid_volume = 0
+        weighted_bid_distance = 0
+        # Look at the top 5 levels of the bid book
+        for price_key, size in list(order_book.bids.items())[:5]:
+            price = -price_key
+            distance_from_mid = mid_price - price
+            weighted_bid_distance += size * distance_from_mid
+            total_bid_volume += size
+
+        total_ask_volume = 0
+        weighted_ask_distance = 0
+        # Look at the top 5 levels of the ask book
+        for price, size in list(order_book.asks.items())[:5]:
+            distance_from_mid = price - mid_price
+            weighted_ask_distance += size * distance_from_mid
+            total_ask_volume += size
+
+        # Avoid division by zero if a side of the book is empty
+        if total_bid_volume == 0 or total_ask_volume == 0:
+            # Fallback to a simple spread-based measure if the book is one-sided
+            return 1.0
+
+        # Calculate the average distance of liquidity from the mid-price for each side
+        avg_bid_distance = weighted_bid_distance / total_bid_volume
+        avg_ask_distance = weighted_ask_distance / total_ask_volume
+        vwas = avg_bid_distance + avg_ask_distance
+
+        # --- Convert VWAS to k ---
+        # k should be inversely proportional to the VWAS. A wide VWAS means low liquidity (low k).
+        # The scaling factor is a key tuning parameter that translates VWAS into the right magnitude for 'k'.
+        if vwas < 1e-9:
+            return 1000.0 # High liquidity if spread is zero
+
+        k = 1.0 / vwas
+        return max(1.0, k * self.k_scaling_factor)
 
     def _calculate_trend_skew(self) -> float:
         """Calculates trend by fitting a regression line to recent mid-prices."""
-        trend_window = 20
-        if len(self.mid_price_history) < trend_window:
+        if len(self.mid_price_history) < self.trend_window:
             return 0.0
-        
-        recent_prices = list(self.mid_price_history)[-trend_window:]
-        time_steps = np.arange(trend_window)
+
+        recent_prices = list(self.mid_price_history)[-self.trend_window:]
+
+        time_steps = np.arange(self.trend_window)
         regression = linregress(time_steps, recent_prices)
         slope = regression.slope
-        max_skew = 0.005 # Cap the skew at half a cent
         
-        return np.clip(slope, -max_skew, max_skew)
-
-    def _get_calm_market_quotes(self, order_book: OrderBook) -> tuple[float, float]:
-        """
-        Calculates quotes for a calm market using a hybrid approach.
-        It respects a minimum spread while trying to improve on the market price.
-        """
-        mid_price = order_book.mid_price
-        
-        minimum_spread = 2 * TICK_SIZE
-        ideal_bid = mid_price - (minimum_spread / 2)
-        ideal_ask = mid_price + (minimum_spread / 2)
-
-        opportunistic_bid = order_book.best_bid + TICK_SIZE
-        opportunistic_ask = order_book.best_ask - TICK_SIZE
-
-        final_bid = max(ideal_bid, opportunistic_bid)
-        final_ask = min(ideal_ask, opportunistic_ask)
-        
-        if final_bid >= final_ask:
-            return self._round_to_tick(ideal_bid), self._round_to_tick(ideal_ask)
-
-        return self._round_to_tick(final_bid), self._round_to_tick(final_ask)
+        return np.clip(slope, -self.max_skew, self.max_skew)
     
     def calculate_quotes(self, order_book: OrderBook, inventory_position: float, time_horizon: float) -> tuple[float | None, float | None]:
         mid_price = order_book.mid_price
@@ -90,10 +104,6 @@ class AvellanedaStoikovStrategy(BaseStrategy):
         price_changes = price_series.diff().dropna()
         measured_volatility = price_changes.ewm(span=self.ewma_span).std().iloc[-1]
         effective_volatility = max(measured_volatility, 0.0001) if pd.notna(measured_volatility) else 0.0001
-
-        #if self.volatility == 0 or pd.isna(self.volatility):
-        #    logger.info("Zero volatility detected. Using hybrid calm market quotes.")
-        #    return self._get_calm_market_quotes(order_book)
 
         k = self._estimate_liquidity(order_book)
 
