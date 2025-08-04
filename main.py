@@ -47,7 +47,7 @@ def main():
     bot = MarketMakerBot(
         market_id=market_id,
         strategy=strategy,
-        lot_size=10.0,
+        risk_fraction=0.1,
         dry_run=True
     )
 

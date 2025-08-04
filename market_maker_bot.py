@@ -22,11 +22,11 @@ POSITION_LIMIT = 500.0
 class MarketMakerBot:
     """A generic bot runner that operates using a provided strategy module."""
 
-    def __init__(self, market_id: str, strategy: BaseStrategy, lot_size: float = 10.0, dry_run: bool = True):
+    def __init__(self, market_id: str, strategy: BaseStrategy, risk_fraction: float = 0.1, dry_run: bool = True):
         # --- Configuration ---
         self.market_id = market_id
         self.strategy = strategy
-        self.lot_size = lot_size
+        self.risk_fraction = risk_fraction
         self.dry_run = dry_run
         self.is_running = True
 
@@ -109,8 +109,40 @@ class MarketMakerBot:
         # Total equity is our cash plus the current market value of our assets
         self.total_value = self.cash + market_value
 
+    def _calculate_order_sizes(self) -> tuple[float, float]:
+        """Calculates dynamic order sizes based on equity, inventory, and liquidity."""
+        
+        mid_price = self.order_book.mid_price
+        if not mid_price or mid_price <= 0:
+            return 1.0, 1.0 # Return a default minimum size if mid_price is invalid
+
+        # 1. Base size based on a fraction of our total equity
+        base_size = (self.total_value * self.risk_fraction) / mid_price
+        
+        # 2. Inventory adjustment factor (skew sizing)
+        # Increase size when we want to offload inventory, decrease when accumulating
+        inventory_factor_buy = 1.0 - (self.inventory_position / POSITION_LIMIT)
+        inventory_factor_sell = 1.0 + (self.inventory_position / POSITION_LIMIT)
+        
+        bid_size = base_size * inventory_factor_buy
+        ask_size = base_size * inventory_factor_sell
+        
+        # 3. Liquidity adjustment
+        # Don't place orders larger than a fraction of the visible volume at the best price
+        #liquidity_fraction = 0.5
+        #if self.order_book.best_ask:
+        #    ask_size = min(ask_size, self.order_book.asks[self.order_book.best_ask] * liquidity_fraction)
+        #if self.order_book.best_bid:
+        #    bid_size = min(bid_size, self.order_book.bids[-self.order_book.best_bid] * liquidity_fraction)
+
+        # Ensure sizes are not zero
+        return max(1.0, bid_size), max(1.0, ask_size)
+
     def _update_orders(self, new_bid: float, new_ask: float):
         """Manages order cancellations and placements to match the strategy's target."""
+
+        bid_size, ask_size = self._calculate_order_sizes()
+
         # Cancel ask if price needs to change
         if self.active_ask['id'] is not None and self.active_ask['price'] != new_ask:
             self._cancel_order(self.active_ask['id'])
@@ -123,15 +155,15 @@ class MarketMakerBot:
 
         # Place new bid if we don't have one
         if self.active_bid['id'] is None and self.inventory_position < POSITION_LIMIT:
-            order_id = self._place_order("BUY", new_bid, self.lot_size)
+            order_id = self._place_order("BUY", new_bid, bid_size)
             if order_id:
-                self.active_bid = {'id': order_id, 'price': new_bid, 'size': self.lot_size}
+                self.active_bid = {'id': order_id, 'price': new_bid, 'size': bid_size}
 
         # Place new ask if we don't have one
         if self.active_ask['id'] is None and self.inventory_position > -POSITION_LIMIT:
-            order_id = self._place_order("SELL", new_ask, self.lot_size)
+            order_id = self._place_order("SELL", new_ask, ask_size)
             if order_id:
-                self.active_ask = {'id': order_id, 'price': new_ask, 'size': self.lot_size}
+                self.active_ask = {'id': order_id, 'price': new_ask, 'size': ask_size}
 
     def _check_fills(self, trade: dict):
         """Checks for fills and updates inventory, cash, and P&L."""
@@ -241,8 +273,11 @@ class MarketMakerBot:
         """Cancels all currently active orders."""
         if self.active_bid.get('id'):
             self._cancel_order(self.active_bid['id'])
+            self.active_bid = {'id': None, 'price': 0.0, 'size': 0.0}
         if self.active_ask.get('id'):
             self._cancel_order(self.active_ask['id'])
+            self.active_ask = {'id': None, 'price': 0.0, 'size': 0.0}
+
 
     async def _decrement_time(self):
         """Dynamically calculates the time horizon based on the market's actual close time."""
