@@ -6,39 +6,43 @@ import aiohttp
 import websockets
 import csv
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Optional, List, Dict, Any
 
 from order_book import OrderBook
 from trade_history import TradeHistory
 from event_dispatcher import EventDispatcher
 from utils import get_yes_token_for_market, get_market_close_time
 from strategies.base_strategy import BaseStrategy
+from execution_client import ExecutionClient
 
 logger = logging.getLogger(__name__)
 
 WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
-POSITION_LIMIT = 500.0
+POSITION_LIMIT = 1500.0
 
 class MarketMakerBot:
     """A generic bot runner that operates using a provided strategy module."""
 
-    def __init__(self, market_id: str, strategy: BaseStrategy, risk_fraction: float = 0.1, dry_run: bool = True):
+    def __init__(self,
+                 market_id: str,
+                 strategy: BaseStrategy,
+                 execution_client: ExecutionClient,
+                 base_order_size: float = 250.0,
+                 simulated_orders: List[Dict[str, Any]] = None,
+                 simulated_fills: List[Dict[str, Any]] = None):
+                 
         # --- Configuration ---
         self.market_id = market_id
         self.strategy = strategy
-        self.risk_fraction = risk_fraction
-        self.dry_run = dry_run
+        self.base_order_size = base_order_size
+        self.execution_client = execution_client
         self.is_running = True
 
         # --- Reporting & Simulation ---
-        self.simulated_orders = []
-        self.simulated_fills = []
-        self.order_id_generator = itertools.count(1)
+        self.simulated_orders = simulated_orders if simulated_orders is not None else []
+        self.simulated_fills = simulated_fills if simulated_fills is not None else []
 
-        if self.dry_run:
-            logger.warning("Bot is running in DRY RUN mode. No real orders will be placed.")
-
-        # --- Performance Tracking State ---
+        # --- Performance Tracking ---
         self.realized_pnl = 0.0
         self.unrealized_pnl = 0.0
         self.cash = 10000.0
@@ -66,6 +70,10 @@ class MarketMakerBot:
 
     def _on_update(self, event_type: str, data: dict):
         """Core trigger, called by the dispatcher after any data update."""
+
+        if not self.is_running:
+            return
+
         if event_type == "last_trade_price":
             self._check_fills(data)
 
@@ -110,32 +118,25 @@ class MarketMakerBot:
         self.total_value = self.cash + market_value
 
     def _calculate_order_sizes(self) -> tuple[float, float]:
-        """Calculates dynamic order sizes based on equity, inventory, and liquidity."""
-        
+        """Calculates dynamic order sizes based on base size, inventory, and liquidity."""
         mid_price = self.order_book.mid_price
-        if not mid_price or mid_price <= 0:
-            return 1.0, 1.0 # Return a default minimum size if mid_price is invalid
+        if not mid_price: # Safety check
+            return 1.0, 1.0
 
-        # 1. Base size based on a fraction of our total equity
-        base_size = (self.total_value * self.risk_fraction) / mid_price
-        
-        # 2. Inventory adjustment factor (skew sizing)
-        # Increase size when we want to offload inventory, decrease when accumulating
         inventory_factor_buy = 1.0 - (self.inventory_position / POSITION_LIMIT)
         inventory_factor_sell = 1.0 + (self.inventory_position / POSITION_LIMIT)
         
-        bid_size = base_size * inventory_factor_buy
-        ask_size = base_size * inventory_factor_sell
+        bid_size = self.base_order_size * inventory_factor_buy
+        ask_size = self.base_order_size * inventory_factor_sell
         
         # 3. Liquidity adjustment
         # Don't place orders larger than a fraction of the visible volume at the best price
-        #liquidity_fraction = 0.5
-        #if self.order_book.best_ask:
-        #    ask_size = min(ask_size, self.order_book.asks[self.order_book.best_ask] * liquidity_fraction)
-        #if self.order_book.best_bid:
-        #    bid_size = min(bid_size, self.order_book.bids[-self.order_book.best_bid] * liquidity_fraction)
+        liquidity_fraction = 0.72
+        if self.order_book.best_ask and self.order_book.best_ask in self.order_book.asks:
+            ask_size = min(ask_size, self.order_book.asks[self.order_book.best_ask] * liquidity_fraction)
+        if self.order_book.best_bid and -self.order_book.best_bid in self.order_book.bids:
+            bid_size = min(bid_size, self.order_book.bids[-self.order_book.best_bid] * liquidity_fraction)
 
-        # Ensure sizes are not zero
         return max(1.0, bid_size), max(1.0, ask_size)
 
     def _update_orders(self, new_bid: float, new_ask: float):
@@ -232,42 +233,12 @@ class MarketMakerBot:
             logger.info(f"FILL: {side} {fill_amount} @ {trade_price:.3f}. New Inventory: {self.inventory_position:+.1f}")
 
     def _place_order(self, side: str, price: float, size: float) -> int | None:
-        """Records the intent to place an order and simulates or executes it."""
-        order_id = next(self.order_id_generator)
-
-        order_record = {
-            'timestamp': datetime.now(timezone.utc).isoformat(),
-            'action': 'PLACE',
-            'order_id': order_id,
-            'side': side,
-            'price': price,
-            'size': size
-        }
-        self.simulated_orders.append(order_record)
-
-        if self.dry_run:
-            logger.info(f"[DRY RUN] PLACING {side} order for {size} @ {price:.3f} (Simulated ID: {order_id})")
-            return order_id
-        else:
-            # To-Do: Implement REAL order placement logic here.
-            # The real exchange-provided order ID should be returned.
-            logger.error("LIVE TRADING NOT IMPLEMENTED")
-            return None
+        """Delegates order placement to the execution client."""
+        return self.execution_client.place_order(side, price, size)
 
     def _cancel_order(self, order_id: int):
-        """Records the intent to cancel an order and simulates or executes it."""
-        order_record = {
-            'timestamp': datetime.now(timezone.utc).isoformat(),
-            'action': 'CANCEL',
-            'order_id': order_id
-        }
-        self.simulated_orders.append(order_record)
-
-        if self.dry_run:
-            logger.info(f"[DRY RUN] CANCELING order {order_id}")
-        else:
-            # To-Do: Implement REAL order cancellation logic here.
-            logger.error("LIVE TRADING NOT IMPLEMENTED")
+        """Delegates order cancellation to the execution client."""
+        return self.execution_client.cancel_order(order_id)
 
     def _cancel_all_orders(self):
         """Cancels all currently active orders."""
@@ -342,15 +313,55 @@ class MarketMakerBot:
                     await asyncio.sleep(5)
 
     def stop(self):
-        """Signals the bot to gracefully shut down."""
-        logger.info("Stop signal received. Shutting down bot for market %s...", self.market_id)
-        self.is_running = False
+        """Signals the bot's main run loop to terminate."""
+        if self.is_running:
+            logger.info("Stop signal received. Shutting down bot for market %s...", self.market_id)
+            self.is_running = False
+
+    async def shutdown(self):
+        """
+        Shuts down the bot, liquidating any open positions with aggressive market orders.
+        """
+        self.stop() # Ensure the main loop is signaled to stop
+        print() # Move to a new line to preserve the last status update
+        logger.info("--- Starting Aggressive Shutdown ---")
+
+        logger.info("Canceling all active orders...")
+        self._cancel_all_orders()
+        await asyncio.sleep(0.1) # Brief pause to allow cancellations to process
+
+        if abs(self.inventory_position) > 1e-9:
+            logger.warning("Bot has remaining inventory of %+.2f. Liquidating position...", self.inventory_position)
+
+            # If we are long, we need to sell immediately
+            if self.inventory_position > 0:
+                if self.order_book.best_bid:
+                    price = self.order_book.best_bid
+                    size = self.inventory_position
+                    logger.info("Placing aggressive SELL order for %.2f @ %.3f", size, price)
+                    self._place_order("SELL", price, size)
+                else:
+                    logger.error("Cannot liquidate long position: No buyers in the order book.")
+            
+            # If we are short, we need to buy back immediately
+            else: # self.inventory_position < 0
+                if self.order_book.best_ask:
+                    price = self.order_book.best_ask
+                    size = abs(self.inventory_position)
+                    logger.info("Placing aggressive BUY order for %.2f @ %.3f", size, price)
+                    self._place_order("BUY", price, size)
+                else:
+                    logger.error("Cannot liquidate short position: No sellers in the order book.")
+        else:
+            logger.info("Inventory is flat. No liquidation needed.")
+
+        self.save_report()
+        logger.info("--- Shutdown Complete ---")
 
     def save_report(self):
         """Saves the simulated orders and fills to CSV files."""
         logger.info("Saving simulation report to CSV files...")
         
-        # Save orders
         if self.simulated_orders:
             with open('simulated_orders.csv', 'w', newline='') as f:
                 writer = csv.DictWriter(f, fieldnames=self.simulated_orders[0].keys())
@@ -358,7 +369,6 @@ class MarketMakerBot:
                 writer.writerows(self.simulated_orders)
             logger.info("Saved simulated_orders.csv")
 
-        # Save fills
         if self.simulated_fills:
             with open('simulated_fills.csv', 'w', newline='') as f:
                 writer = csv.DictWriter(f, fieldnames=self.simulated_fills[0].keys())
