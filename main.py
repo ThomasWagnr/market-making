@@ -76,7 +76,7 @@ def main():
         market_id=market_id,
         strategy=strategy,
         execution_client=execution_client,
-        base_order_size=100.0,
+        base_order_value=100.0,
         simulated_fills=simulated_fills_list
     )
 
