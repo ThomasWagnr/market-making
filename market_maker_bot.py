@@ -76,11 +76,15 @@ class MarketMakerBot:
 
         self._update_pnl()
 
+        total_bid_size, total_ask_size = self._calculate_order_sizes()
+
         # 2. Delegate quote calculation to the strategy module
-        new_bid, new_ask = self.strategy.calculate_quotes(
+        new_bids, new_asks = self.strategy.calculate_quotes(
             order_book=self.order_book,
             inventory_position=self.inventory_position,
-            time_horizon=self.time_horizon
+            time_horizon=self.time_horizon,
+            total_bid_size=total_bid_size,
+            total_ask_size=total_ask_size
         )
 
         # 3. Print current state to the console
@@ -89,8 +93,8 @@ class MarketMakerBot:
         print(f"\r{state_str}", end="", flush=True)
 
         # 4. Update orders on the exchange based on the strategy's decision
-        if new_bid is not None and new_ask is not None:
-            self._update_orders(new_bid, new_ask)
+        if new_bids or new_asks:
+            self._update_orders(new_bids, new_asks)
         else:
             self._cancel_all_orders()
 
@@ -115,55 +119,76 @@ class MarketMakerBot:
         self.total_value = self.cash + market_value
 
     def _calculate_order_sizes(self) -> tuple[float, float]:
-        """Calculates dynamic order sizes based on base size, inventory, and liquidity."""
+        """
+        Calculates dynamic, symmetric order sizes that preserve the inventory
+        skew ratio even when constrained by liquidity.
+        """
         mid_price = self.order_book.mid_price
         if not mid_price or mid_price <= 1e-9: # Safety check
             return 1.0, 1.0
 
-        target_size_in_shares = self.base_order_value / mid_price
+        base_size = self.base_order_value / mid_price
 
         inventory_factor_buy = 1.0 - (self.inventory_position / POSITION_LIMIT)
         inventory_factor_sell = 1.0 + (self.inventory_position / POSITION_LIMIT)
-        
-        bid_size = target_size_in_shares * inventory_factor_buy
-        ask_size = target_size_in_shares * inventory_factor_sell
+
+        initial_bid_size = base_size * inventory_factor_buy
+        initial_ask_size = base_size * inventory_factor_sell
         
         # 3. Liquidity adjustment
         # Don't place orders larger than a fraction of the visible volume at the best price
         liquidity_fraction = 0.72
+        max_bid_size_by_liquidity = float('inf')
+        max_ask_size_by_liquidity = float('inf')
+
         if self.order_book.best_ask and self.order_book.best_ask in self.order_book.asks:
-            ask_size = min(ask_size, self.order_book.asks[self.order_book.best_ask] * liquidity_fraction)
+            max_ask_size_by_liquidity = self.order_book.asks[self.order_book.best_ask] * liquidity_fraction
         if self.order_book.best_bid and -self.order_book.best_bid in self.order_book.bids:
-            bid_size = min(bid_size, self.order_book.bids[-self.order_book.best_bid] * liquidity_fraction)
+            max_bid_size_by_liquidity = self.order_book.bids[-self.order_book.best_bid] * liquidity_fraction
+
+        bid_scaling_factor = max_bid_size_by_liquidity / (initial_bid_size + 1e-9)
+        ask_scaling_factor = max_ask_size_by_liquidity / (initial_ask_size + 1e-9)
+
+        final_scaling_factor = min(1.0, bid_scaling_factor, ask_scaling_factor)
+
+        # Calculate the actual sizes that preserve the inventory skew
+        bid_size = initial_bid_size * final_scaling_factor
+        ask_size = initial_ask_size * final_scaling_factor
 
         return max(1.0, bid_size), max(1.0, ask_size)
 
-    def _update_orders(self, new_bid: float, new_ask: float):
+    def _update_orders(self, new_bids: List[Dict[str, Any]], new_asks: List[Dict[str, Any]]):
         """Manages order cancellations and placements to match the strategy's target."""
 
-        bid_size, ask_size = self._calculate_order_sizes()
+        target_bid_prices = {q['price'] for q in new_bids}
 
-        # Cancel ask if price needs to change
-        if self.active_ask['id'] is not None and self.active_ask['price'] != new_ask:
-            self._cancel_order(self.active_ask['id'])
-            self.active_ask = {'id': None, 'price': 0.0, 'size': 0.0}
+        # Cancel any active bids whose price is no longer in the target ladder
+        for order_id, order in list(self.active_bids.items()):
+            if order['price'] not in target_bid_prices:
+                self._cancel_order(order_id)
+                del self.active_bids[order_id]
 
-        # Cancel bid if price needs to change
-        if self.active_bid['id'] is not None and self.active_bid['price'] != new_bid:
-            self._cancel_order(self.active_bid['id'])
-            self.active_bid = {'id': None, 'price': 0.0, 'size': 0.0}
+        # Place new bids for price levels where we don't have an order yet
+        active_bid_prices = {o['price'] for o in self.active_bids.values()}
+        for quote in new_bids:
+            if quote['price'] not in active_bid_prices and self.inventory_position < POSITION_LIMIT:
+                order_id = self._place_order("BUY", quote['price'], quote['size'])
+                if order_id:
+                    self.active_bids[order_id] = quote
 
-        # Place new bid if we don't have one
-        if self.active_bid['id'] is None and self.inventory_position < POSITION_LIMIT:
-            order_id = self._place_order("BUY", new_bid, bid_size)
-            if order_id:
-                self.active_bid = {'id': order_id, 'price': new_bid, 'size': bid_size}
+        # --- Symmetrical Logic for Asks ---
+        target_ask_prices = {q['price'] for q in new_asks}
+        for order_id, order in list(self.active_asks.items()):
+            if order['price'] not in target_ask_prices:
+                self._cancel_order(order_id)
+                del self.active_asks[order_id]
 
-        # Place new ask if we don't have one
-        if self.active_ask['id'] is None and self.inventory_position > -POSITION_LIMIT:
-            order_id = self._place_order("SELL", new_ask, ask_size)
-            if order_id:
-                self.active_ask = {'id': order_id, 'price': new_ask, 'size': ask_size}
+        active_ask_prices = {o['price'] for o in self.active_asks.values()}
+        for quote in new_asks:
+            if quote['price'] not in active_ask_prices and self.inventory_position > -POSITION_LIMIT:
+                order_id = self._place_order("SELL", quote['price'], quote['size'])
+                if order_id:
+                    self.active_asks[order_id] = quote
 
     def _check_fills(self, trade: dict):
         """
@@ -182,73 +207,60 @@ class MarketMakerBot:
         else:
             return 
 
-        side = None
-        fill_amount = 0.0
-        our_fill_price = 0.0
-
-        # Check for a bid fill
-        if self.active_bid['id'] and abs(equivalent_yes_price - self.active_bid['price']) <= 1e-9:
-            side = 'BUY'
-            our_fill_price = self.active_bid['price']
-            fill_amount = min(trade_size, self.active_bid['size'])
-            is_full_fill = (self.active_bid['size'] - fill_amount) <= 1e-9
-
-            self.active_bid['size'] -= fill_amount
-            if is_full_fill:
-                self.active_bid = {'id': None, 'price': 0.0, 'size': 0.0}
+        # Check for bid fills
+        for order_id, order in list(self.active_bids.items()):
+            if abs(equivalent_yes_price - order['price']) <= 1e-9:
+                self._process_fill('BUY', order['price'], min(trade_size, order['size']), order_id)
         
-        elif self.active_ask['id'] and abs(equivalent_yes_price - self.active_ask['price']) <= 1e-9:
-            side = 'SELL'
-            our_fill_price = self.active_ask['price']
-            fill_amount = min(trade_size, self.active_ask['size'])
-            is_full_fill = (self.active_ask['size'] - fill_amount) <= 1e-9
+        # Check for ask fills
+        for order_id, order in list(self.active_asks.items()):
+            if abs(equivalent_yes_price - order['price']) <= 1e-9:
+                self._process_fill('SELL', order['price'], min(trade_size, order['size']), order_id)
+
+    def _process_fill(self, side: str, price: float, size: float, order_id: int):
+        """Processes a single fill, updating inventory, P&L, and active orders."""
+        self.simulated_fills.append({
+            'timestamp': datetime.now(timezone.utc).isoformat(),
+            'side': side, 'price': price, 'size': size
+        })
+
+        if side == 'BUY':
+            active_order_book = self.active_bids
             
-            self.active_ask['size'] -= fill_amount
-            if is_full_fill:
-                self.active_ask = {'id': None, 'price': 0.0, 'size': 0.0}
+            if self.inventory_position < 0:
+                self.realized_pnl += (self.average_entry_price - price) * size
+            else:
+                new_total_cost = (self.average_entry_price * self.inventory_position) + (price * size)
+                new_inventory = self.inventory_position + size
+                if abs(new_inventory) > 1e-9:
+                    self.average_entry_price = new_total_cost / new_inventory
+            
+            self.inventory_position += size
+            self.cash -= size * price
+        else: # SELL
+            active_order_book = self.active_asks
+
+            if self.inventory_position > 0:
+                self.realized_pnl += (price - self.average_entry_price) * size
+            else:
+                new_total_cost = (self.average_entry_price * abs(self.inventory_position)) + (price * size)
+                new_inventory = abs(self.inventory_position) + size
+                if abs(new_inventory) > 1e-9:
+                    self.average_entry_price = new_total_cost / new_inventory
+            
+            self.inventory_position -= size
+            self.cash += size * price
         
-        if side:
-            self.simulated_fills.append({
-                'timestamp': datetime.now(timezone.utc).isoformat(),
-                'side': side, 'price': our_fill_price, 'size': fill_amount
-            })
+        # Update active order state
+        if order_id in active_order_book:
+            active_order_book[order_id]['size'] -= size
+            if active_order_book[order_id]['size'] <= 1e-9:
+                del active_order_book[order_id]
+        
+        if abs(self.inventory_position) < 1e-9:
+            self.average_entry_price = 0.0
 
-            # Update cash and inventory position
-            if side == 'BUY':
-                # --- Update Average Entry Price ---
-                # If reducing a short position, realize P&L
-                if self.inventory_position < 0:
-                    self.realized_pnl += (self.average_entry_price - our_fill_price) * fill_amount
-                # If opening or adding to a long position, update avg price
-                else: 
-                    new_total_cost = (self.average_entry_price * self.inventory_position) + (our_fill_price * fill_amount)
-                    new_inventory = self.inventory_position + fill_amount
-                    if abs(new_inventory) > 1e-9:
-                        self.average_entry_price = new_total_cost / new_inventory
-                
-                self.inventory_position += fill_amount
-                self.cash -= fill_amount * our_fill_price
-
-            else: # SELL
-                # --- Update Average Entry Price ---
-                # If reducing a long position, realize P&L
-                if self.inventory_position > 0:
-                    self.realized_pnl += (our_fill_price - self.average_entry_price) * fill_amount
-                # If opening or adding to a short position, update avg price
-                else:
-                    new_total_cost = (self.average_entry_price * abs(self.inventory_position)) + (our_fill_price * fill_amount)
-                    new_inventory = abs(self.inventory_position) + fill_amount
-                    if abs(new_inventory) > 1e-9:
-                        self.average_entry_price = new_total_cost / new_inventory
-                
-                self.inventory_position -= fill_amount
-                self.cash += fill_amount * our_fill_price
-
-            # Reset average entry price if position is now flat
-            if abs(self.inventory_position) < 1e-9:
-                self.average_entry_price = 0.0
-
-            logger.info(f"FILL: {side} {fill_amount} @ {our_fill_price:.3f}. New Inventory: {self.inventory_position:+.1f}")
+        logger.info(f"FILL: {side} {size:.2f} @ {price:.3f}. New Inventory: {self.inventory_position:+.1f}")
 
     def _place_order(self, side: str, price: float, size: float) -> int | None:
         """Delegates order placement to the execution client."""
@@ -259,13 +271,14 @@ class MarketMakerBot:
         return self.execution_client.cancel_order(order_id)
 
     def _cancel_all_orders(self):
-        """Cancels all currently active orders."""
-        if self.active_bid.get('id'):
-            self._cancel_order(self.active_bid['id'])
-            self.active_bid = {'id': None, 'price': 0.0, 'size': 0.0}
-        if self.active_ask.get('id'):
-            self._cancel_order(self.active_ask['id'])
-            self.active_ask = {'id': None, 'price': 0.0, 'size': 0.0}
+        """Cancels all currently active orders on both sides."""
+        for order_id in list(self.active_bids.keys()):
+            self._cancel_order(order_id)
+        self.active_bids.clear()
+        
+        for order_id in list(self.active_asks.keys()):
+            self._cancel_order(order_id)
+        self.active_asks.clear()
 
 
     async def _decrement_time(self):
