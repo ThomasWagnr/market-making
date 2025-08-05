@@ -4,12 +4,17 @@ from order_book import OrderBook
 from trade_history import TradeHistory
 
 class EventDispatcher:
-    """Parses WebSocket messages, dispatches them, and triggers a callback."""
+    """
+    Parses messages and dispatches them. It updates one primary order book
+    but processes trades from all subscribed feeds.
+    """
 
-    def __init__(self, order_book: OrderBook, trade_history: TradeHistory, update_callback: Callable):
-        self.order_book = order_book
+    def __init__(self, primary_order_book: OrderBook, primary_asset_id: str, 
+                 trade_history: TradeHistory, update_callback: Callable):
+        self.primary_order_book = primary_order_book
+        self.primary_asset_id = primary_asset_id
         self.trade_history = trade_history
-        self.market_id = order_book.market_id
+        self.market_id = primary_order_book.market_id
         self.update_callback = update_callback
 
     def dispatch(self, raw_message: str):
@@ -19,18 +24,20 @@ class EventDispatcher:
             events = [events]
 
         for event in events:
-            # Only process events for the dispatcher's market
-            if event.get("market") != self.market_id:
-                continue
-
             event_type = event.get("event_type")
-            
-            if event_type == "book":
-                self.order_book.update_from_snapshot(event)
-            elif event_type == "price_change":
-                self.order_book.update_from_price_change(event)
-            elif event_type == "last_trade_price":
+            asset_id = event.get("asset_id")
+
+            # --- MODIFIED: Simplified Routing Logic ---
+            # Only update the book if the event is for our primary asset
+            if event_type in ["book", "price_change"] and asset_id == self.primary_asset_id:
+                if event_type == "book":
+                    self.primary_order_book.update_from_snapshot(event)
+                else: # price_change
+                    self.primary_order_book.update_from_price_change(event)
+
+            # Always process trades to capture all market activity
+            if event_type == "last_trade_price":
                 self.trade_history.add_trade(event)
-                
-            if self.update_callback:
-                self.update_callback(event_type, event)
+            
+            # Notify the bot of any update
+            self.update_callback(event_type, event)
