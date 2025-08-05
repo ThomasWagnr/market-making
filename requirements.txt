@@ -1,7 +1,8 @@
 # Core data science and analysis
 numpy==2.0.2
 pandas==2.3.1
-matplotlib
+matplotlib==3.8.4
+scipy==1.13.1
 
 # HTTP and WebSocket libraries
 requests==2.32.4
@@ -9,8 +10,8 @@ aiohttp==3.12.15
 websockets==13.1
 
 # JSON and data structures
-orjson
-sortedcontainers
+orjson==3.10.7
+sortedcontainers==2.4.0
 
 # Date and time utilities
 python-dateutil==2.9.0.post0
