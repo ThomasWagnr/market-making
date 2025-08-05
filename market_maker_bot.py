@@ -51,8 +51,8 @@ class MarketMakerBot:
         
         # --- Live State ---
         self.inventory_position = 0.0
-        self.active_bid = {'id': None, 'price': 0.0, 'size': 0.0}
-        self.active_ask = {'id': None, 'price': 0.0, 'size': 0.0}
+        self.active_bids : Dict[int, Dict[str, Any]] = {}
+        self.active_asks : Dict[int, Dict[str, Any]] = {}
 
         # --- Market State ---
         self.time_horizon = 1.0
