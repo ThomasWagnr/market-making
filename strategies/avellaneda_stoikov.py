@@ -11,6 +11,7 @@ from order_book import OrderBook
 
 logger = logging.getLogger(__name__)
 TICK_SIZE = 0.001
+MINIMUM_VOLATILITY = 0.0001
 
 class AvellanedaStoikovStrategy(BaseStrategy):
     """
