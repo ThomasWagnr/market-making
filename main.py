@@ -60,9 +60,13 @@ def main():
         gamma=10.0,
         lookback_period=20,
         ewma_span=20,
-        trend_skew=True,
+        enable_trend_skew=True,
+        enable_layering=True,
         k_scaling_factor=10.0,
-        max_skew=0.005
+        max_skew=0.005,
+        layer_price_step=1,
+        layer_size_ratio=1.5,
+        max_layers=5
     )
 
     simulated_orders_list = []
