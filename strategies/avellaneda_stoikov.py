@@ -3,32 +3,45 @@ import numpy as np
 import pandas as pd
 from collections import deque
 from scipy.stats import linregress
+from typing import List, Dict, Any, Tuple
+import logging
+
 from .base_strategy import BaseStrategy
 from order_book import OrderBook
-import logging
 
 logger = logging.getLogger(__name__)
 TICK_SIZE = 0.001
 
 class AvellanedaStoikovStrategy(BaseStrategy):
-    """Implements the Avellaneda-Stoikov market making model."""
+    """
+    Implements a highly configurable Avellaneda-Stoikov market making model with dynamic 
+    liquidity estimation, EWMA volatility, optional trend skew, and optional quote layering.
+    """
 
     def __init__(self, 
                 gamma: float = 10, 
                 lookback_period: int = 100, 
                 ewma_span: int = 20, 
-                trend_skew: bool = True,
+                enable_trend_skew: bool = True,
+                enable_layering : bool = True,
                 trend_window: int = 20,
                 max_skew: float = 0.005,
-                k_scaling_factor: float = 10.0):
+                k_scaling_factor: float = 10.0,
+                layer_price_step : int = 1,
+                layer_size_ratio: float = 1.5,
+                max_layers: int = 5):
 
         self.gamma = gamma
         self.lookback_period = lookback_period
-        self.trend_skew = trend_skew
+        self.enable_trend_skew = enable_trend_skew
+        self.enable_layering = enable_layering
         self.ewma_span = ewma_span
         self.trend_window = trend_window
         self.max_skew = max_skew
         self.k_scaling_factor = k_scaling_factor
+        self.layer_price_step = layer_price_step
+        self.layer_size_ratio = layer_size_ratio
+        self.max_layers = max_layers
         self.mid_price_history = deque(maxlen=lookback_period)
 
     def _estimate_liquidity(self, order_book: OrderBook) -> float:
@@ -88,41 +101,80 @@ class AvellanedaStoikovStrategy(BaseStrategy):
         slope = regression.slope
         
         return np.clip(slope, -self.max_skew, self.max_skew)
+
+    def _create_quote_ladder(self, total_size: float, best_price: float, side: str) -> List[Dict[str, Any]]:
+        """Builds a ladder of quotes with progressively larger size."""
+        quotes = []
+        remaining_size = total_size
+        current_price = best_price
+        layer_num = 1
+        
+        if self.layer_size_ratio <= 1.0 or self.max_layers <= 1:
+            base_size = total_size / self.max_layers
+        else:
+            r_n = self.layer_size_ratio ** self.max_layers
+            base_size = total_size * (1 - self.layer_size_ratio) / (1 - r_n)
+
+        current_layer_size = base_size
+        
+        while remaining_size > 1.0 and layer_num <= self.max_layers:
+            size_for_this_layer = min(remaining_size, current_layer_size)
+            
+            quotes.append({'price': self._round_to_tick(current_price), 'size': round(size_for_this_layer, 2)})
+            
+            remaining_size -= size_for_this_layer
+            current_layer_size *= self.layer_size_ratio
+            
+            if side == "BUY":
+                current_price -= self.layer_price_step * TICK_SIZE
+            else: # SELL
+                current_price += self.layer_price_step * TICK_SIZE
+            
+            layer_num += 1
+            
+        return quotes
     
-    def calculate_quotes(self, order_book: OrderBook, inventory_position: float, time_horizon: float) -> tuple[float | None, float | None]:
+    def calculate_quotes(self, order_book: OrderBook, inventory_position: float, 
+                         time_horizon: float, total_bid_size: float, total_ask_size: float) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        
         mid_price = order_book.mid_price
         if mid_price is None:
-            return None, None
+            return [], []
 
         self.mid_price_history.append(mid_price)
 
         if len(self.mid_price_history) < self.lookback_period:
             logger.info(f"Strategy warming up. Data collected: {len(self.mid_price_history)}/{self.lookback_period}")
-            return None, None
+            return [], []
 
         price_series = pd.Series(list(self.mid_price_history))
         price_changes = price_series.diff().dropna()
         measured_volatility = price_changes.ewm(span=self.ewma_span).std().iloc[-1]
-        effective_volatility = max(measured_volatility, 0.0001) if pd.notna(measured_volatility) else 0.0001
+        effective_volatility = max(measured_volatility, MINIMUM_VOLATILITY) if pd.notna(measured_volatility) else MINIMUM_VOLATILITY
 
         k = self._estimate_liquidity(order_book)
+        skew = self._calculate_trend_skew() if self.enable_trend_skew else 0.0
 
-        skew = self._calculate_trend_skew() if self.trend_skew else 0.0
         inventory_term = inventory_position * self.gamma * effective_volatility**2 * time_horizon
         reservation_price = mid_price - inventory_term + skew
 
         liquidity_term = math.log(1 + self.gamma / k)
         spread = self.gamma * effective_volatility**2 * time_horizon + (2 / self.gamma) * liquidity_term
 
-        our_bid = self._round_to_tick(reservation_price - (spread / 2))
-        our_ask = self._round_to_tick(reservation_price + (spread / 2))
+        best_bid_price = reservation_price - (spread / 2)
+        best_ask_price = reservation_price + (spread / 2)
 
-        if our_bid >= our_ask or our_bid < 0 or our_ask > 1:
-            logger.warning(f"Strategy calculated invalid quotes. Bid: {our_bid:.3f}, Ask: {our_ask:.3f}. Standing down.")
-            return None, None
+        if best_bid_price >= best_ask_price or best_bid_price < 0 or best_ask_price > 1:
+            return [], []
 
-        logger.info(f"Strategy calculated quotes. Bid: {our_bid:.3f}, Ask: {our_ask:.3f}")
-        return our_bid, our_ask
+        if self.enable_layering:
+            bid_quotes = self._create_quote_ladder(total_bid_size, best_bid_price, "BUY")
+            ask_quotes = self._create_quote_ladder(total_ask_size, best_ask_price, "SELL")
+        else:
+            bid_quotes = [{'price': self._round_to_tick(best_bid_price), 'size': total_bid_size}]
+            ask_quotes = [{'price': self._round_to_tick(best_ask_price), 'size': total_ask_size}]
+        
+        return bid_quotes, ask_quotes
 
     def _round_to_tick(self, price: float) -> float:
         return round(price / TICK_SIZE) * TICK_SIZE
