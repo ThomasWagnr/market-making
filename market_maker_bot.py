@@ -27,8 +27,7 @@ class MarketMakerBot:
                  market_id: str,
                  strategy: BaseStrategy,
                  execution_client: ExecutionClient,
-                 base_order_size: float = 250.0,
-                 simulated_orders: List[Dict[str, Any]] = None,
+                 base_order_value: float = 100.0,
                  simulated_fills: List[Dict[str, Any]] = None):
 
         # --- Configuration ---
@@ -36,18 +35,18 @@ class MarketMakerBot:
         self.yes_token_id: Optional[str] = None
         self.no_token_id: Optional[str] = None
         self.strategy = strategy
-        self.base_order_size = base_order_size
+        self.base_order_value = base_order_value
         self.execution_client = execution_client
         self.is_running = True
 
         # --- Reporting & Simulation ---
-        self.simulated_orders = simulated_orders if simulated_orders is not None else []
         self.simulated_fills = simulated_fills if simulated_fills is not None else []
 
         # --- Performance Tracking ---
         self.realized_pnl = 0.0
         self.unrealized_pnl = 0.0
         self.cash = 10000.0
+        self.total_value = self.cash
         self.average_entry_price = 0.0
         
         # --- Live State ---
@@ -64,11 +63,7 @@ class MarketMakerBot:
         # --- Component Initialization ---
         self.order_book = OrderBook(self.market_id)
         self.trade_history = TradeHistory(self.market_id)
-        self.dispatcher = EventDispatcher(
-            order_book=self.order_book,
-            trade_history=self.trade_history,
-            update_callback=self._on_update
-        )
+        self.dispatcher : Optional[EventDispatcher] = None
 
     def _on_update(self, event_type: str, data: dict):
         """Core trigger, called by the dispatcher after any data update."""
@@ -122,14 +117,16 @@ class MarketMakerBot:
     def _calculate_order_sizes(self) -> tuple[float, float]:
         """Calculates dynamic order sizes based on base size, inventory, and liquidity."""
         mid_price = self.order_book.mid_price
-        if not mid_price: # Safety check
+        if not mid_price or mid_price <= 1e-9: # Safety check
             return 1.0, 1.0
+
+        target_size_in_shares = self.base_order_value / mid_price
 
         inventory_factor_buy = 1.0 - (self.inventory_position / POSITION_LIMIT)
         inventory_factor_sell = 1.0 + (self.inventory_position / POSITION_LIMIT)
         
-        bid_size = self.base_order_size * inventory_factor_buy
-        ask_size = self.base_order_size * inventory_factor_sell
+        bid_size = target_size_in_shares * inventory_factor_buy
+        ask_size = target_size_in_shares * inventory_factor_sell
         
         # 3. Liquidity adjustment
         # Don't place orders larger than a fraction of the visible volume at the best price
@@ -173,7 +170,8 @@ class MarketMakerBot:
         Checks for fills from either the YES or NO token feed
         and updates inventory, cash, and P&L.
         """
-        asset_id = trade['asset_id']
+        asset_id = trade.get('asset_id')
+        if not asset_id: return
         trade_price = float(trade['price'])
         trade_size = float(trade['size'])
 
@@ -224,7 +222,9 @@ class MarketMakerBot:
                 # If opening or adding to a long position, update avg price
                 else: 
                     new_total_cost = (self.average_entry_price * self.inventory_position) + (our_fill_price * fill_amount)
-                    self.average_entry_price = new_total_cost / (self.inventory_position + fill_amount)
+                    new_inventory = self.inventory_position + fill_amount
+                    if abs(new_inventory) > 1e-9:
+                        self.average_entry_price = new_total_cost / new_inventory
                 
                 self.inventory_position += fill_amount
                 self.cash -= fill_amount * our_fill_price
@@ -237,7 +237,9 @@ class MarketMakerBot:
                 # If opening or adding to a short position, update avg price
                 else:
                     new_total_cost = (self.average_entry_price * abs(self.inventory_position)) + (our_fill_price * fill_amount)
-                    self.average_entry_price = new_total_cost / (abs(self.inventory_position) + fill_amount)
+                    new_inventory = abs(self.inventory_position) + fill_amount
+                    if abs(new_inventory) > 1e-9:
+                        self.average_entry_price = new_total_cost / new_inventory
                 
                 self.inventory_position -= fill_amount
                 self.cash += fill_amount * our_fill_price
@@ -288,7 +290,7 @@ class MarketMakerBot:
         async with aiohttp.ClientSession() as session:
             # --- Fetch market info on startup ---
             tokens, close_time = await asyncio.gather(
-                get_market_tokens(session, self.market_id), # Use the new function
+                get_market_tokens(session, self.market_id),
                 get_market_close_time(session, self.market_id)
             )
 
@@ -297,6 +299,13 @@ class MarketMakerBot:
                 return
 
             self.yes_token_id, self.no_token_id = tokens
+            self.dispatcher = EventDispatcher(
+                primary_order_book=self.order_book,
+                primary_asset_id=self.yes_token_id,
+                trade_history=self.trade_history,
+                update_callback=self._on_update
+            )
+            
             self.market_close_time = close_time
             self.market_start_time = datetime.now(timezone.utc)
             self.session_duration_seconds = \
