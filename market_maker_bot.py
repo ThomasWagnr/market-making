@@ -158,37 +158,58 @@ class MarketMakerBot:
         return max(1.0, bid_size), max(1.0, ask_size)
 
     def _update_orders(self, new_bids: List[Dict[str, Any]], new_asks: List[Dict[str, Any]]):
-        """Manages order cancellations and placements to match the strategy's target."""
+        """
+        Reconciles active orders with the new target quote (ladder) from the strategy,
+        checking both price and size for changes.
+        """
+        # --- Create a map of target quotes for efficient lookup: {price: size} ---
+        target_bids_map = {q['price']: q['size'] for q in new_bids}
+        target_asks_map = {q['price']: q['size'] for q in new_asks}
+        
+        # Define a tolerance for size changes to prevent flickering
+        size_tolerance = 10 
 
-        target_bid_prices = {q['price'] for q in new_bids}
-
-        # Cancel any active bids whose price is no longer in the target ladder
+        # --- Reconcile Bids ---
+        # Cancel bids that are no longer in our target ladder or have the wrong size
         for order_id, order in list(self.active_bids.items()):
-            if order['price'] not in target_bid_prices:
+            should_be_cancelled = False
+            if order['price'] not in target_bids_map:
+                # Cancel if the price is no longer in our target ladder
+                should_be_cancelled = True
+            elif abs(order['size'] - target_bids_map[order['price']]) > size_tolerance:
+                # Cancel if the size is significantly different from our new target size
+                should_be_cancelled = True
+                
+            if should_be_cancelled:
                 self._cancel_order(order_id)
-                del self.active_bids[order_id]
-
-        # Place new bids for price levels where we don't have an order yet
+                if order_id in self.active_bids: del self.active_bids[order_id]
+        
+        # Place new bids for price levels where we don't have an order
         active_bid_prices = {o['price'] for o in self.active_bids.values()}
-        for quote in new_bids:
-            if quote['price'] not in active_bid_prices and self.inventory_position < POSITION_LIMIT:
-                order_id = self._place_order("BUY", quote['price'], quote['size'])
+        for price, size in target_bids_map.items():
+            if price not in active_bid_prices and self.inventory_position < POSITION_LIMIT:
+                order_id = self._place_order("BUY", price, size)
                 if order_id:
-                    self.active_bids[order_id] = quote
+                    self.active_bids[order_id] = {'price': price, 'size': size}
 
         # --- Symmetrical Logic for Asks ---
-        target_ask_prices = {q['price'] for q in new_asks}
         for order_id, order in list(self.active_asks.items()):
-            if order['price'] not in target_ask_prices:
+            should_be_cancelled = False
+            if order['price'] not in target_asks_map:
+                should_be_cancelled = True
+            elif abs(order['size'] - target_asks_map[order['price']]) > size_tolerance:
+                should_be_cancelled = True
+            
+            if should_be_cancelled:
                 self._cancel_order(order_id)
-                del self.active_asks[order_id]
+                if order_id in self.active_asks: del self.active_asks[order_id]
 
         active_ask_prices = {o['price'] for o in self.active_asks.values()}
-        for quote in new_asks:
-            if quote['price'] not in active_ask_prices and self.inventory_position > -POSITION_LIMIT:
-                order_id = self._place_order("SELL", quote['price'], quote['size'])
+        for price, size in target_asks_map.items():
+            if price not in active_ask_prices and self.inventory_position > -POSITION_LIMIT:
+                order_id = self._place_order("SELL", price, size)
                 if order_id:
-                    self.active_asks[order_id] = quote
+                    self.active_asks[order_id] = {'price': price, 'size': size}
 
     def _check_fills(self, trade: dict):
         """
@@ -394,23 +415,4 @@ class MarketMakerBot:
         else:
             logger.info("Inventory is flat. No liquidation needed.")
 
-        self.save_report()
         logger.info("--- Shutdown Complete ---")
-
-    def save_report(self):
-        """Saves the simulated orders and fills to CSV files."""
-        logger.info("Saving simulation report to CSV files...")
-        
-        if self.simulated_orders:
-            with open('simulated_orders.csv', 'w', newline='') as f:
-                writer = csv.DictWriter(f, fieldnames=self.simulated_orders[0].keys())
-                writer.writeheader()
-                writer.writerows(self.simulated_orders)
-            logger.info("Saved simulated_orders.csv")
-
-        if self.simulated_fills:
-            with open('simulated_fills.csv', 'w', newline='') as f:
-                writer = csv.DictWriter(f, fieldnames=self.simulated_fills[0].keys())
-                writer.writeheader()
-                writer.writerows(self.simulated_fills)
-            logger.info("Saved simulated_fills.csv")

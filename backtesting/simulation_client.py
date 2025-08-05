@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from typing import List, Dict, Any, Callable
 
 # Note the '..' for importing from the parent directory
-from ..execution_client import ExecutionClient
+from execution_client import ExecutionClient
 
 logger = logging.getLogger(__name__)
 
