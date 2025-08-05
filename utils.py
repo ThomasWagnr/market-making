@@ -1,48 +1,46 @@
 import logging
 import aiohttp
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
 MARKET_INFO_URL = "https://clob.polymarket.com/markets/{market_id}"
 
-async def get_yes_token_for_market(session: aiohttp.ClientSession, market_id: str) -> Optional[str]:
+async def get_market_tokens(session: aiohttp.ClientSession, market_id: str) -> Optional[Tuple[str, str]]:
     """
-    Fetches the YES token ID for a given market ID using an existing aiohttp session.
+    Fetches both the YES and NO token IDs for a given market ID.
 
     Args:
         session: An active aiohttp.ClientSession.
-        market_id: The hex string ID of the market.
+        market_id: The string ID of the market.
 
     Returns:
-        The string token ID for the 'Yes' outcome, or None if not found or an error occurs.
+        A tuple containing (yes_token_id, no_token_id), or None if either is not found.
     """
     url = MARKET_INFO_URL.format(market_id=market_id)
-    logger.debug("Fetching token for market ID: %s", market_id)
+    logger.debug("Fetching tokens for market ID: %s", market_id)
 
     try:
         async with session.get(url, timeout=10) as resp:
-            # Raises an HTTPError for bad responses (4xx or 5xx)
             resp.raise_for_status()
             info = await resp.json()
+            
+            yes_token = next((t.get('token_id') for t in info.get('tokens', []) if t.get('outcome') == 'Yes'), None)
+            no_token = next((t.get('token_id') for t in info.get('tokens', []) if t.get('outcome') == 'No'), None)
 
-            token_id = next(
-                (t.get('token_id') for t in info.get('tokens', []) if t.get('outcome') == 'Yes'),
-                None
-            )
-
-            if not token_id:
-                logger.warning("'Yes' token not found in API response for market %s", market_id)
-
-            return token_id
-
+            if not yes_token or not no_token:
+                logger.warning("Could not find both YES and NO tokens for market %s", market_id)
+                return None
+            
+            logger.info("Found YES token (%s) and NO token (%s)", yes_token, no_token)
+            return yes_token, no_token
+            
     except aiohttp.ClientError as e:
-        logger.error("Aiohttp client error fetching token for market %s: %s", market_id, e)
+        logger.error("Aiohttp client error fetching tokens for market %s: %s", market_id, e)
         return None
     except Exception as e:
-        # Catch any other unexpected errors
-        logger.error("Unexpected error fetching token for market %s: %s", market_id, e, exc_info=True)
+        logger.error("Unexpected error fetching tokens for market %s: %s", market_id, e, exc_info=True)
         return None
 
 async def get_market_close_time(session: aiohttp.ClientSession, market_id: str) -> Optional[datetime]:
