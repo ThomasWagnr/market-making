@@ -11,7 +11,7 @@ from typing import Optional, List, Dict, Any
 from order_book import OrderBook
 from trade_history import TradeHistory
 from event_dispatcher import EventDispatcher
-from utils import get_yes_token_for_market, get_market_close_time
+from utils import get_market_tokens, get_market_close_time
 from strategies.base_strategy import BaseStrategy
 from execution_client import ExecutionClient
 
@@ -30,9 +30,11 @@ class MarketMakerBot:
                  base_order_size: float = 250.0,
                  simulated_orders: List[Dict[str, Any]] = None,
                  simulated_fills: List[Dict[str, Any]] = None):
-                 
+
         # --- Configuration ---
         self.market_id = market_id
+        self.yes_token_id: Optional[str] = None
+        self.no_token_id: Optional[str] = None
         self.strategy = strategy
         self.base_order_size = base_order_size
         self.execution_client = execution_client
@@ -167,16 +169,29 @@ class MarketMakerBot:
                 self.active_ask = {'id': order_id, 'price': new_ask, 'size': ask_size}
 
     def _check_fills(self, trade: dict):
-        """Checks for fills and updates inventory, cash, and P&L."""
+        """
+        Checks for fills from either the YES or NO token feed
+        and updates inventory, cash, and P&L.
+        """
+        asset_id = trade['asset_id']
         trade_price = float(trade['price'])
         trade_size = float(trade['size'])
 
+        if asset_id == self.yes_token_id:
+            equivalent_yes_price = trade_price
+        elif asset_id == self.no_token_id:
+            equivalent_yes_price = 1.0 - trade_price
+        else:
+            return 
+
         side = None
         fill_amount = 0.0
+        our_fill_price = 0.0
 
         # Check for a bid fill
-        if self.active_bid['id'] and trade_price == self.active_bid['price']:
+        if self.active_bid['id'] and abs(equivalent_yes_price - self.active_bid['price']) <= 1e-9:
             side = 'BUY'
+            our_fill_price = self.active_bid['price']
             fill_amount = min(trade_size, self.active_bid['size'])
             is_full_fill = (self.active_bid['size'] - fill_amount) <= 1e-9
 
@@ -184,8 +199,9 @@ class MarketMakerBot:
             if is_full_fill:
                 self.active_bid = {'id': None, 'price': 0.0, 'size': 0.0}
         
-        elif self.active_ask['id'] and trade_price == self.active_ask['price']:
+        elif self.active_ask['id'] and abs(equivalent_yes_price - self.active_ask['price']) <= 1e-9:
             side = 'SELL'
+            our_fill_price = self.active_ask['price']
             fill_amount = min(trade_size, self.active_ask['size'])
             is_full_fill = (self.active_ask['size'] - fill_amount) <= 1e-9
             
@@ -196,7 +212,7 @@ class MarketMakerBot:
         if side:
             self.simulated_fills.append({
                 'timestamp': datetime.now(timezone.utc).isoformat(),
-                'side': side, 'price': trade_price, 'size': fill_amount
+                'side': side, 'price': our_fill_price, 'size': fill_amount
             })
 
             # Update cash and inventory position
@@ -204,33 +220,33 @@ class MarketMakerBot:
                 # --- Update Average Entry Price ---
                 # If reducing a short position, realize P&L
                 if self.inventory_position < 0:
-                    self.realized_pnl += (self.average_entry_price - trade_price) * fill_amount
+                    self.realized_pnl += (self.average_entry_price - our_fill_price) * fill_amount
                 # If opening or adding to a long position, update avg price
                 else: 
-                    new_total_cost = (self.average_entry_price * self.inventory_position) + (trade_price * fill_amount)
+                    new_total_cost = (self.average_entry_price * self.inventory_position) + (our_fill_price * fill_amount)
                     self.average_entry_price = new_total_cost / (self.inventory_position + fill_amount)
                 
                 self.inventory_position += fill_amount
-                self.cash -= fill_amount * trade_price
+                self.cash -= fill_amount * our_fill_price
 
             else: # SELL
                 # --- Update Average Entry Price ---
                 # If reducing a long position, realize P&L
                 if self.inventory_position > 0:
-                    self.realized_pnl += (trade_price - self.average_entry_price) * fill_amount
+                    self.realized_pnl += (our_fill_price - self.average_entry_price) * fill_amount
                 # If opening or adding to a short position, update avg price
                 else:
-                    new_total_cost = (self.average_entry_price * abs(self.inventory_position)) + (trade_price * fill_amount)
+                    new_total_cost = (self.average_entry_price * abs(self.inventory_position)) + (our_fill_price * fill_amount)
                     self.average_entry_price = new_total_cost / (abs(self.inventory_position) + fill_amount)
                 
                 self.inventory_position -= fill_amount
-                self.cash += fill_amount * trade_price
+                self.cash += fill_amount * our_fill_price
 
             # Reset average entry price if position is now flat
             if abs(self.inventory_position) < 1e-9:
                 self.average_entry_price = 0.0
 
-            logger.info(f"FILL: {side} {fill_amount} @ {trade_price:.3f}. New Inventory: {self.inventory_position:+.1f}")
+            logger.info(f"FILL: {side} {fill_amount} @ {our_fill_price:.3f}. New Inventory: {self.inventory_position:+.1f}")
 
     def _place_order(self, side: str, price: float, size: float) -> int | None:
         """Delegates order placement to the execution client."""
@@ -271,15 +287,16 @@ class MarketMakerBot:
 
         async with aiohttp.ClientSession() as session:
             # --- Fetch market info on startup ---
-            yes_token_id, close_time = await asyncio.gather(
-                get_yes_token_for_market(session, self.market_id),
+            tokens, close_time = await asyncio.gather(
+                get_market_tokens(session, self.market_id), # Use the new function
                 get_market_close_time(session, self.market_id)
             )
 
-            if not yes_token_id or not close_time:
+            if not tokens or not close_time:
                 logger.critical("Failed to get market token or close time. Shutting down.")
                 return
 
+            self.yes_token_id, self.no_token_id = tokens
             self.market_close_time = close_time
             self.market_start_time = datetime.now(timezone.utc)
             self.session_duration_seconds = \
@@ -298,9 +315,9 @@ class MarketMakerBot:
                     logger.info("Attempting to connect to WebSocket...")
                     async with websockets.connect(WS_URL, ping_interval=20) as ws:
                         logger.info("WebSocket connected for market %s.", self.market_id)
-                        sub_msg = {"assets_ids": [yes_token_id], "type": "market"}
+                        sub_msg = {"assets_ids": [self.yes_token_id, self.no_token_id], "type": "market"}
                         await ws.send(json.dumps(sub_msg))
-                        logger.info("Subscribed to market updates. Listening...")
+                        logger.info("Subscribed to market updates of both YES and NO tokens. Listening...")
 
                         async for message in ws:
                             if not self.is_running:
