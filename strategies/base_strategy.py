@@ -1,5 +1,6 @@
 from abc import ABC, abstractmethod
 from order_book import OrderBook
+from typing import List, Dict, Any
 
 class BaseStrategy(ABC):
     """Abstract base class for a market making strategy."""
@@ -17,5 +18,12 @@ class BaseStrategy(ABC):
         Returns:
             A tuple containing the desired (bid_price, ask_price).
             Returns (None, None) if no quote should be made.
+        """
+        pass
+
+    @abstractmethod
+    def get_size_tolerance(self, order_book: OrderBook, active_order: Dict[str, Any]) -> float:
+        """
+        Calculates the re-quoting size tolerance for a given active order.
         """
         pass

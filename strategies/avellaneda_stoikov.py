@@ -29,7 +29,11 @@ class AvellanedaStoikovStrategy(BaseStrategy):
                 k_scaling_factor: float = 10.0,
                 layer_price_step : int = 1,
                 layer_size_ratio: float = 1.5,
-                max_layers: int = 5):
+                max_layers: int = 3,
+                max_size_tolerance_pct: float = 0.80,
+                min_size_tolerance_pct: float = 0.20,
+                patience_depth_factor: float = 0.8, # e.g., "deep queue" is 50% of avg depth
+                book_depth_ma_window: int = 100,):
 
         self.gamma = gamma
         self.lookback_period = lookback_period
@@ -42,6 +46,10 @@ class AvellanedaStoikovStrategy(BaseStrategy):
         self.layer_price_step = layer_price_step
         self.layer_size_ratio = layer_size_ratio
         self.max_layers = max_layers
+        self.max_size_tolerance_pct = max_size_tolerance_pct
+        self.min_size_tolerance_pct = min_size_tolerance_pct
+        self.patience_depth_factor = patience_depth_factor
+        self.book_depth_history = deque(maxlen=book_depth_ma_window)
         self.mid_price_history = deque(maxlen=lookback_period)
 
     def _estimate_liquidity(self, order_book: OrderBook) -> float:
@@ -88,6 +96,32 @@ class AvellanedaStoikovStrategy(BaseStrategy):
 
         k = 1.0 / vwas
         return max(1.0, k * self.k_scaling_factor)
+
+    def _update_dynamic_parameters(self, order_book: OrderBook) -> float:
+        """
+        Calculates and returns the max_patience_depth based on a moving average of book depth.
+        """
+        top_bids_volume = sum(size for _, size in list(order_book.bids.items())[:5])
+        top_asks_volume = sum(size for _, size in list(order_book.asks.items())[:5])
+        self.book_depth_history.append(top_bids_volume + top_asks_volume)
+        
+        if len(self.book_depth_history) < self.book_depth_history.maxlen:
+            return 500.0 # Return a safe default during warm-up
+
+        average_depth = np.mean(self.book_depth_history)
+        return average_depth * self.patience_depth_factor
+
+    def get_size_tolerance(self, order_book: OrderBook, active_order: Dict[str, Any]) -> float:
+        """Calculates a dynamic tolerance based on the order's queue position."""
+        max_patience_depth = self._update_dynamic_parameters(order_book)
+        volume_ahead = active_order.get('volume_ahead', max_patience_depth)
+        
+        queue_depth_ratio = min(1.0, volume_ahead / (max_patience_depth + 1e-9))
+        
+        # Linearly interpolate between the max and min tolerance based on queue depth
+        dynamic_tolerance = self.max_size_tolerance_pct - \
+                            (queue_depth_ratio * (self.max_size_tolerance_pct - self.min_size_tolerance_pct))
+        return dynamic_tolerance
 
     def _calculate_trend_skew(self) -> float:
         """Calculates trend by fitting a regression line to recent mid-prices."""
