@@ -66,7 +66,11 @@ def main():
         max_skew=0.005,
         layer_price_step=1,
         layer_size_ratio=1.5,
-        max_layers=3
+        max_layers=3,
+        max_size_tolerance_pct=0.80,
+        min_size_tolerance_pct=0.20,
+        patience_depth_factor=0.8,
+        book_depth_ma_window=100
     )
 
     simulated_orders_list = []
