@@ -10,7 +10,6 @@ from .base_strategy import BaseStrategy
 from order_book import OrderBook
 
 logger = logging.getLogger(__name__)
-TICK_SIZE = 0.001
 MINIMUM_VOLATILITY = 0.0001
 
 class AvellanedaStoikovStrategy(BaseStrategy):
@@ -103,7 +102,7 @@ class AvellanedaStoikovStrategy(BaseStrategy):
         
         return np.clip(slope, -self.max_skew, self.max_skew)
 
-    def _create_quote_ladder(self, total_size: float, best_price: float, side: str) -> List[Dict[str, Any]]:
+    def _create_quote_ladder(self, total_size: float, best_price: float, side: str, tick_size: float) -> List[Dict[str, Any]]:
         """Builds a ladder of quotes with progressively larger size."""
         quotes = []
         remaining_size = total_size
@@ -111,25 +110,28 @@ class AvellanedaStoikovStrategy(BaseStrategy):
         layer_num = 1
         
         if self.layer_size_ratio <= 1.0 or self.max_layers <= 1:
-            base_size = total_size / self.max_layers
+            base_size = total_size / self.max_layers if self.max_layers > 0 else total_size
         else:
             r_n = self.layer_size_ratio ** self.max_layers
-            base_size = total_size * (1 - self.layer_size_ratio) / (1 - r_n)
+            if (1 - r_n) == 0:
+                base_size = total_size / self.max_layers
+            else:
+                base_size = total_size * (1 - self.layer_size_ratio) / (1 - r_n)
 
         current_layer_size = base_size
         
         while remaining_size > 1.0 and layer_num <= self.max_layers:
             size_for_this_layer = min(remaining_size, current_layer_size)
             
-            quotes.append({'price': self._round_to_tick(current_price), 'size': round(size_for_this_layer, 2)})
+            quotes.append({'price': self._round_to_tick(current_price, tick_size), 'size': round(size_for_this_layer, 2)})
             
             remaining_size -= size_for_this_layer
             current_layer_size *= self.layer_size_ratio
             
             if side == "BUY":
-                current_price -= self.layer_price_step * TICK_SIZE
+                current_price -= self.layer_price_step * tick_size
             else: # SELL
-                current_price += self.layer_price_step * TICK_SIZE
+                current_price += self.layer_price_step * tick_size
             
             layer_num += 1
             
@@ -169,13 +171,15 @@ class AvellanedaStoikovStrategy(BaseStrategy):
             return [], []
 
         if self.enable_layering:
-            bid_quotes = self._create_quote_ladder(total_bid_size, best_bid_price, "BUY")
-            ask_quotes = self._create_quote_ladder(total_ask_size, best_ask_price, "SELL")
+            bid_quotes = self._create_quote_ladder(total_bid_size, best_bid_price, "BUY", order_book.tick_size)
+            ask_quotes = self._create_quote_ladder(total_ask_size, best_ask_price, "SELL", order_book.tick_size)
         else:
-            bid_quotes = [{'price': self._round_to_tick(best_bid_price), 'size': total_bid_size}]
-            ask_quotes = [{'price': self._round_to_tick(best_ask_price), 'size': total_ask_size}]
+            bid_quotes = [{'price': self._round_to_tick(best_bid_price, order_book.tick_size), 'size': total_bid_size}]
+            ask_quotes = [{'price': self._round_to_tick(best_ask_price, order_book.tick_size), 'size': total_ask_size}]
         
         return bid_quotes, ask_quotes
 
-    def _round_to_tick(self, price: float) -> float:
-        return round(price / TICK_SIZE) * TICK_SIZE
+    def _round_to_tick(self, price: float, tick_size: float) -> float:
+        """Rounds a price to the nearest valid tick size for the market."""
+        if tick_size <= 0: return price
+        return round(price / tick_size) * tick_size

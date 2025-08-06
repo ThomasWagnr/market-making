@@ -5,8 +5,9 @@ class OrderBook:
     """
     Manages the state of the order book for a single market.
     """
-    def __init__(self, market_id: str):
+    def __init__(self, market_id: str, tick_size: float):
         self.market_id = market_id
+        self.tick_size = tick_size
         self.bids = SortedDict()
         self.asks = SortedDict()
 
