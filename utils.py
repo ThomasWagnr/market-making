@@ -1,83 +1,47 @@
 import logging
 import aiohttp
 from datetime import datetime, timezone
-from typing import Optional, Tuple
+from typing import Optional, Dict, Any, Tuple
 
 logger = logging.getLogger(__name__)
 
 MARKET_INFO_URL = "https://clob.polymarket.com/markets/{market_id}"
 
-async def get_market_tokens(session: aiohttp.ClientSession, market_id: str) -> Optional[Tuple[str, str]]:
+async def get_market_details(session: aiohttp.ClientSession, market_id: str) -> Optional[Dict[str, Any]]:
     """
-    Fetches both the YES and NO token IDs for a given market ID.
-
-    Args:
-        session: An active aiohttp.ClientSession.
-        market_id: The string ID of the market.
-
-    Returns:
-        A tuple containing (yes_token_id, no_token_id), or None if either is not found.
+    Fetches all key details for a market.
     """
     url = MARKET_INFO_URL.format(market_id=market_id)
-    logger.debug("Fetching tokens for market ID: %s", market_id)
-
+    logger.info("Fetching market details for: %s", market_id)
     try:
         async with session.get(url, timeout=10) as resp:
             resp.raise_for_status()
-            info = await resp.json()
+            market_data = await resp.json()
             
-            yes_token = next((t.get('token_id') for t in info.get('tokens', []) if t.get('outcome') == 'Yes'), None)
-            no_token = next((t.get('token_id') for t in info.get('tokens', []) if t.get('outcome') == 'No'), None)
-
-            if not yes_token or not no_token:
-                logger.warning("Could not find both YES and NO tokens for market %s", market_id)
-                return None
+            yes_token = next((t.get('token_id') for t in market_data.get('tokens', []) if t.get('outcome') == 'Yes'), None)
+            no_token = next((t.get('token_id') for t in market_data.get('tokens', []) if t.get('outcome') == 'No'), None)
+            close_time_str = market_data.get('end_date_iso')
             
-            logger.info("Found YES token (%s) and NO token (%s)", yes_token, no_token)
-            return yes_token, no_token
-            
-    except aiohttp.ClientError as e:
-        logger.error("Aiohttp client error fetching tokens for market %s: %s", market_id, e)
-        return None
-    except Exception as e:
-        logger.error("Unexpected error fetching tokens for market %s: %s", market_id, e, exc_info=True)
-        return None
+            min_tick_size = market_data.get('minimum_tick_size')
+            min_order_size = market_data.get('minimum_order_size')
 
-async def get_market_close_time(session: aiohttp.ClientSession, market_id: str) -> Optional[datetime]:
-    """
-    Fetches the closing time for a given market ID and returns it as a timezone-aware datetime object.
-
-    Args:
-        session: An active aiohttp.ClientSession.
-        market_id: The hex string ID of the market.
-
-    Returns:
-        A timezone-aware datetime object representing the market's closing time, or None on failure.
-    """
-    url = MARKET_INFO_URL.format(market_id=market_id)
-    logger.debug("Fetching close time for market ID: %s", market_id)
-
-    try:
-        async with session.get(url, timeout=10) as resp:
-            resp.raise_for_status()
-            info = await resp.json()
-
-            close_time_str = info.get('end_date_iso')
-            if not close_time_str:
-                logger.warning("Market close time not found in API response for market %s", market_id)
+            # Validate that we got everything
+            if not all([yes_token, no_token, close_time_str, min_tick_size, min_order_size]):
+                logger.error("API response for market %s was missing required data.", market_id)
                 return None
 
             if close_time_str.endswith('Z'):
                 close_time_str = close_time_str[:-1] + '+00:00'
+            close_time = datetime.fromisoformat(close_time_str)
 
-            return datetime.fromisoformat(close_time_str)
-
-    except aiohttp.ClientError as e:
-        logger.error("Aiohttp client error fetching close time for market %s: %s", market_id, e)
-        return None
-    except (ValueError, TypeError) as e:
-        logger.error("Error parsing close time for market %s: %s", market_id, e)
-        return None
+            return {
+                "yes_token_id": yes_token,
+                "no_token_id": no_token,
+                "close_time": close_time,
+                "min_tick_size": float(min_tick_size),
+                "min_order_size": float(min_order_size)
+            }
+            
     except Exception as e:
-        logger.error("Unexpected error fetching close time for market %s: %s", market_id, e, exc_info=True)
+        logger.error("Error fetching market details for %s: %s", market_id, e, exc_info=True)
         return None
