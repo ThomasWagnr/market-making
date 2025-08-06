@@ -32,8 +32,9 @@ class AvellanedaStoikovStrategy(BaseStrategy):
                 max_layers: int = 3,
                 max_size_tolerance_pct: float = 0.80,
                 min_size_tolerance_pct: float = 0.20,
-                patience_depth_factor: float = 0.8, # e.g., "deep queue" is 50% of avg depth
-                book_depth_ma_window: int = 100,):
+                patience_depth_factor: float = 0.8,
+                book_depth_ma_window: int = 100,
+                liquidity_fraction: float = 0.7):
 
         self.gamma = gamma
         self.lookback_period = lookback_period
@@ -136,39 +137,55 @@ class AvellanedaStoikovStrategy(BaseStrategy):
         
         return np.clip(slope, -self.max_skew, self.max_skew)
 
-    def _create_quote_ladder(self, total_size: float, best_price: float, side: str, tick_size: float) -> List[Dict[str, Any]]:
-        """Builds a ladder of quotes with progressively larger size."""
+    def _create_quote_ladder(self, total_size: float, best_price: float, side: str, 
+                             tick_size: float, order_book: OrderBook) -> List[Dict[str, Any]]:
+        """
+        Builds an opportunistic ladder. It maximizes the top layer based on liquidity,
+        then distributes any remaining size to deeper layers.
+        """
         quotes = []
-        remaining_size = total_size
-        current_price = best_price
-        layer_num = 1
-        
-        if self.layer_size_ratio <= 1.0 or self.max_layers <= 1:
-            base_size = total_size / self.max_layers if self.max_layers > 0 else total_size
-        else:
-            r_n = self.layer_size_ratio ** self.max_layers
-            if (1 - r_n) == 0:
-                base_size = total_size / self.max_layers
-            else:
-                base_size = total_size * (1 - self.layer_size_ratio) / (1 - r_n)
+        if total_size < 1.0:
+            return quotes
 
-        current_layer_size = base_size
+        # --- Layer 1: The Opportunistic Top Layer ---
+        if side == "BUY":
+            # Liquidity for a new bid is capped by the existing best bid's size
+            available_liquidity = order_book.bids.get(-order_book.best_bid, 0) if order_book.best_bid else 0
+        else: # SELL
+            available_liquidity = order_book.asks.get(order_book.best_ask, 0) if order_book.best_ask else 0
+
+        # The size of our top layer is the smaller of our total desired size or the liquidity cap
+        size_layer_1 = min(total_size, available_liquidity * self.liquidity_fraction)
         
-        while remaining_size > 1.0 and layer_num <= self.max_layers:
-            size_for_this_layer = min(remaining_size, current_layer_size)
-            
-            quotes.append({'price': self._round_to_tick(current_price, tick_size), 'size': round(size_for_this_layer, 2)})
-            
-            remaining_size -= size_for_this_layer
-            current_layer_size *= self.layer_size_ratio
-            
-            if side == "BUY":
-                current_price -= self.layer_price_step * tick_size
-            else: # SELL
-                current_price += self.layer_price_step * tick_size
-            
-            layer_num += 1
-            
+        # Place the first layer if its size is meaningful
+        if size_layer_1 >= order_book.min_order_size: # Assuming bot passes order_book which has min_order_size
+            quotes.append({'price': self._round_to_tick(best_price, tick_size), 'size': round(size_layer_1, 2)})
+
+        # --- Deeper Layers: Distribute the Remainder ---
+        remaining_size = total_size - size_layer_1
+        if remaining_size < 1.0 or self.max_layers <= 1:
+            return quotes
+
+        current_price = best_price
+        
+        # Distribute the remaining size evenly across the deeper layers
+        num_deeper_layers = self.max_layers - 1
+        if num_deeper_layers > 0:
+            size_per_deeper_layer = remaining_size / num_deeper_layers
+
+            for _ in range(num_deeper_layers):
+                if remaining_size < 1.0: break
+
+                if side == "BUY":
+                    current_price -= self.layer_price_step * tick_size
+                else: # SELL
+                    current_price += self.layer_price_step * tick_size
+
+                size_for_this_layer = min(remaining_size, size_per_deeper_layer)
+                if size_for_this_layer >= order_book.min_order_size:
+                    quotes.append({'price': self._round_to_tick(current_price, tick_size), 'size': round(size_for_this_layer, 2)})
+                remaining_size -= size_for_this_layer
+        
         return quotes
     
     def calculate_quotes(self, order_book: OrderBook, inventory_position: float, 
@@ -205,8 +222,8 @@ class AvellanedaStoikovStrategy(BaseStrategy):
             return [], []
 
         if self.enable_layering:
-            bid_quotes = self._create_quote_ladder(total_bid_size, best_bid_price, "BUY", order_book.tick_size)
-            ask_quotes = self._create_quote_ladder(total_ask_size, best_ask_price, "SELL", order_book.tick_size)
+            bid_quotes = self._create_quote_ladder(total_bid_size, best_bid_price, "BUY", order_book.tick_size, order_book)
+            ask_quotes = self._create_quote_ladder(total_ask_size, best_ask_price, "SELL", order_book.tick_size, order_book)
         else:
             bid_quotes = [{'price': self._round_to_tick(best_bid_price, order_book.tick_size), 'size': total_bid_size}]
             ask_quotes = [{'price': self._round_to_tick(best_ask_price, order_book.tick_size), 'size': total_ask_size}]

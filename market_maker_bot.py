@@ -122,44 +122,27 @@ class MarketMakerBot:
 
     def _calculate_order_sizes(self) -> tuple[float, float]:
         """
-        Calculates dynamic, symmetric order sizes that preserve the inventory
-        skew ratio even when constrained by liquidity.
+        Calculates the total target order size for each side based on
+        base value and inventory skew. The strategy is responsible for layering.
         """
         mid_price = self.order_book.mid_price
-        if not mid_price or mid_price <= 1e-9: # Safety check
-            return 1.0, 1.0
+        if not mid_price or mid_price <= 1e-9:
+            return 0.0, 0.0 # Return zero if we can't calculate
 
+        # 1. Calculate a base size in shares from our target capital
         base_size = self.base_order_value / mid_price
 
+        # 2. Apply inventory skew
         inventory_factor_buy = 1.0 - (self.inventory_position / POSITION_LIMIT)
         inventory_factor_sell = 1.0 + (self.inventory_position / POSITION_LIMIT)
-
-        initial_bid_size = base_size * inventory_factor_buy
-        initial_ask_size = base_size * inventory_factor_sell
         
-        # 3. Liquidity adjustment
-        # Don't place orders larger than a fraction of the visible volume at the best price
-        liquidity_fraction = 0.72
-        max_bid_size_by_liquidity = float('inf')
-        max_ask_size_by_liquidity = float('inf')
+        total_bid_size = base_size * inventory_factor_buy
+        total_ask_size = base_size * inventory_factor_sell
 
-        if self.order_book.best_ask and self.order_book.best_ask in self.order_book.asks:
-            max_ask_size_by_liquidity = self.order_book.asks[self.order_book.best_ask] * liquidity_fraction
-        if self.order_book.best_bid and -self.order_book.best_bid in self.order_book.bids:
-            max_bid_size_by_liquidity = self.order_book.bids[-self.order_book.best_bid] * liquidity_fraction
-
-        bid_scaling_factor = max_bid_size_by_liquidity / (initial_bid_size + 1e-9)
-        ask_scaling_factor = max_ask_size_by_liquidity / (initial_ask_size + 1e-9)
-
-        final_scaling_factor = min(1.0, bid_scaling_factor, ask_scaling_factor)
-
-        # Calculate the actual sizes that preserve the inventory skew
-        bid_size = initial_bid_size * final_scaling_factor
-        ask_size = initial_ask_size * final_scaling_factor
-
-        final_bid_size = bid_size if bid_size >= self.min_order_size else 0.0
-        final_ask_size = ask_size if ask_size >= self.min_order_size else 0.0
-
+        # 3. Ensure the total size is not below the market minimum
+        final_bid_size = total_bid_size if total_bid_size >= self.min_order_size else 0.0
+        final_ask_size = total_ask_size if total_ask_size >= self.min_order_size else 0.0
+        
         return final_bid_size, final_ask_size
 
     def _update_orders(self, new_bids: List[Dict[str, Any]], new_asks: List[Dict[str, Any]]):
