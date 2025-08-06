@@ -234,30 +234,59 @@ class MarketMakerBot:
 
     def _check_fills(self, trade: dict):
         """
-        Checks for fills from either the YES or NO token feed
-        and updates inventory, cash, and P&L.
+        Checks for fills, respecting the simulated queue 
+        position and updates inventory, cash, and P&L.
         """
         asset_id = trade.get('asset_id')
         if not asset_id: return
         trade_price = float(trade['price'])
-        trade_size = float(trade['size'])
+        remaining_trade_size = float(trade['size'])
 
         if asset_id == self.yes_token_id:
             equivalent_yes_price = trade_price
         elif asset_id == self.no_token_id:
             equivalent_yes_price = 1.0 - trade_price
         else:
-            return 
+            return
 
-        # Check for bid fills
-        for order_id, order in list(self.active_bids.items()):
-            if abs(equivalent_yes_price - order['price']) <= 1e-9:
-                self._process_fill('BUY', order['price'], min(trade_size, order['size']), order_id)
-        
-        # Check for ask fills
-        for order_id, order in list(self.active_asks.items()):
-            if abs(equivalent_yes_price - order['price']) <= 1e-9:
-                self._process_fill('SELL', order['price'], min(trade_size, order['size']), order_id)
+        # --- Check for Bid Fills (Our Buy Orders) ---
+        # Sort by price to process the best-priced orders first
+        sorted_bid_ids = sorted(self.active_bids, key=lambda oid: self.active_bids[oid]['price'], reverse=True)
+        for order_id in sorted_bid_ids:
+            if remaining_trade_size <= 1e-9: break
+            order = self.active_bids.get(order_id)
+            if not order: continue
+
+            if equivalent_yes_price <= order['price']:
+                # This trade first fills orders ahead of us in the queue
+                eats_ahead = min(remaining_trade_size, order['volume_ahead'])
+                order['volume_ahead'] -= eats_ahead
+                remaining_trade_size -= eats_ahead
+
+                if remaining_trade_size <= 1e-9: continue
+
+                # If we are at the front of the queue, we can get filled
+                if order['volume_ahead'] <= 1e-9:
+                    fill_size = min(remaining_trade_size, order['size'])
+                    self._process_fill('BUY', order['price'], fill_size, order_id)
+
+        # --- Symmetrical Logic for Ask Fills (Our Sell Orders) ---
+        sorted_ask_ids = sorted(self.active_asks, key=lambda oid: self.active_asks[oid]['price'])
+        for order_id in sorted_ask_ids:
+            if remaining_trade_size <= 1e-9: break
+            order = self.active_asks.get(order_id)
+            if not order: continue
+
+            if equivalent_yes_price >= order['price']:
+                eats_ahead = min(remaining_trade_size, order['volume_ahead'])
+                order['volume_ahead'] -= eats_ahead
+                remaining_trade_size -= eats_ahead
+
+                if remaining_trade_size <= 1e-9: continue
+                
+                if order['volume_ahead'] <= 1e-9:
+                    fill_size = min(remaining_trade_size, order['size'])
+                    self._process_fill('SELL', order['price'], fill_size, order_id)
 
     def _process_fill(self, side: str, price: float, size: float, order_id: int):
         """Processes a single fill, updating inventory, P&L, and active orders."""
@@ -296,6 +325,7 @@ class MarketMakerBot:
         # Update active order state
         if order_id in active_order_book:
             active_order_book[order_id]['size'] -= size
+            active_order_book[order_id]['volume_ahead'] = 0.0
             if active_order_book[order_id]['size'] <= 1e-9:
                 del active_order_book[order_id]
         
