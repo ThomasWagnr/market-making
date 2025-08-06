@@ -40,6 +40,10 @@ class MarketRecorder:
         
         self.messages_recorded = 0
 
+        self.initial_retry_delay = 1   # Start with a 1-second delay
+        self.max_retry_delay = 64      # Cap the delay at 64 seconds
+        self.retry_multiplier = 2.0    # Double the delay on each failure
+
     async def start(self, shutdown_event: asyncio.Event):
         """Starts the recording process and runs until shutdown is signaled."""
         logger.info(f"[{self.market_id}] Initializing recorder task...")
@@ -50,6 +54,8 @@ class MarketRecorder:
             return
         self.token_ids = list(tokens)
 
+        current_retry_delay = self.initial_retry_delay
+
         while not shutdown_event.is_set():
             try:
                 with gzip.open(self.partial_filepath, 'at') as f:
@@ -57,6 +63,8 @@ class MarketRecorder:
                         subscribe_msg = {"assets_ids": self.token_ids, "type": "market"}
                         await ws.send(json.dumps(subscribe_msg))
                         logger.info(f"[{self.market_id}] Connection successful. Subscribed and recording.")
+
+                        current_retry_delay = self.initial_retry_delay
 
                         while not shutdown_event.is_set():
                             try:
@@ -82,8 +90,9 @@ class MarketRecorder:
                 break
             except Exception as e:
                 if not shutdown_event.is_set():
-                    logger.error(f"[{self.market_id}] An error occurred: {e}. Retrying in 15s...")
-                    await asyncio.sleep(15)
+                    self.logger.error("An error occurred: %s. Retrying in %d s...", e, current_retry_delay)
+                    await asyncio.sleep(current_retry_delay)
+                    current_retry_delay = min(self.max_retry_delay, current_retry_delay * self.retry_multiplier)
         
         logger.info(f"[{self.market_id}] Recording stopped. Total messages: {self.messages_recorded}")
 
