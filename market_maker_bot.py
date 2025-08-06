@@ -11,7 +11,7 @@ from typing import Optional, List, Dict, Any
 from order_book import OrderBook
 from trade_history import TradeHistory
 from event_dispatcher import EventDispatcher
-from utils import get_market_tokens, get_market_close_time
+from utils import get_market_details 
 from strategies.base_strategy import BaseStrategy
 from execution_client import ExecutionClient
 
@@ -32,6 +32,7 @@ class MarketMakerBot:
 
         # --- Configuration ---
         self.market_id = market_id
+        self.min_order_size: float = 1.0
         self.yes_token_id: Optional[str] = None
         self.no_token_id: Optional[str] = None
         self.strategy = strategy
@@ -61,9 +62,9 @@ class MarketMakerBot:
         self.session_duration_seconds: float = 0.0
 
         # --- Component Initialization ---
-        self.order_book = OrderBook(self.market_id)
-        self.trade_history = TradeHistory(self.market_id)
-        self.dispatcher : Optional[EventDispatcher] = None
+        self.order_book: Optional[OrderBook] = None
+        self.trade_history: Optional[TradeHistory] = None
+        self.dispatcher: Optional[EventDispatcher] = None
 
     def _on_update(self, event_type: str, data: dict):
         """Core trigger, called by the dispatcher after any data update."""
@@ -155,7 +156,10 @@ class MarketMakerBot:
         bid_size = initial_bid_size * final_scaling_factor
         ask_size = initial_ask_size * final_scaling_factor
 
-        return max(1.0, bid_size), max(1.0, ask_size)
+        final_bid_size = bid_size if bid_size >= self.min_order_size else 0.0
+        final_ask_size = ask_size if ask_size >= self.min_order_size else 0.0
+
+        return final_bid_size, final_ask_size
 
     def _update_orders(self, new_bids: List[Dict[str, Any]], new_asks: List[Dict[str, Any]]):
         """
@@ -323,16 +327,21 @@ class MarketMakerBot:
 
         async with aiohttp.ClientSession() as session:
             # --- Fetch market info on startup ---
-            tokens, close_time = await asyncio.gather(
-                get_market_tokens(session, self.market_id),
-                get_market_close_time(session, self.market_id)
-            )
+            market_details = await get_market_details(session, self.market_id)
 
-            if not tokens or not close_time:
-                logger.critical("Failed to get market token or close time. Shutting down.")
+            if not market_details:
+                logger.critical("Failed to get market details. Shutting down.")
                 return
 
-            self.yes_token_id, self.no_token_id = tokens
+            # Store all the fetched details
+            self.yes_token_id = market_details['yes_token_id']
+            self.no_token_id = market_details['no_token_id']
+            self.market_close_time = market_details['close_time']
+            self.min_order_size = market_details['min_order_size']
+            tick_size = market_details['min_tick_size']
+
+            self.order_book = OrderBook(self.market_id, tick_size)
+            self.trade_history = TradeHistory(self.market_id)
             self.dispatcher = EventDispatcher(
                 primary_order_book=self.order_book,
                 primary_asset_id=self.yes_token_id,
@@ -340,7 +349,7 @@ class MarketMakerBot:
                 update_callback=self._on_update
             )
             
-            self.market_close_time = close_time
+            self.market_close_time = market_details['close_time']
             self.market_start_time = datetime.now(timezone.utc)
             self.session_duration_seconds = \
                 (self.market_close_time - self.market_start_time).total_seconds()

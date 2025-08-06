@@ -66,7 +66,7 @@ def main():
         max_skew=0.005,
         layer_price_step=1,
         layer_size_ratio=1.5,
-        max_layers=5
+        max_layers=3
     )
 
     simulated_orders_list = []
@@ -94,10 +94,13 @@ def main():
         asyncio.run(bot.shutdown())
 
         logger.info("Saving final reports...")
-        save_report_to_csv('simulated_orders.csv', simulated_orders_list)
-        save_report_to_csv('simulated_fills.csv', bot.simulated_fills)
-        save_report_to_csv('trade_history.csv', bot.trade_history.trade_log)
-
+        if bot.simulated_fills:
+            save_report_to_csv(f'simulated_fills_{timestamp}.csv', bot.simulated_fills)
+        if simulated_orders_list:
+            save_report_to_csv(f'simulated_orders_{timestamp}.csv', simulated_orders_list)
+        if bot.trade_history:
+            save_report_to_csv(f'market_trades_{timestamp}.csv', bot.trade_history.trade_log)
+        
         logger.info("Bot shutdown complete.")
 
 if __name__ == "__main__":
