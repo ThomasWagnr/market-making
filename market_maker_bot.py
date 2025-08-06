@@ -14,6 +14,7 @@ from event_dispatcher import EventDispatcher
 from utils import get_market_details 
 from strategies.base_strategy import BaseStrategy
 from execution_client import ExecutionClient
+from backtesting.simulation_client import SimulatedExchange
 
 logger = logging.getLogger(__name__)
 
@@ -163,57 +164,73 @@ class MarketMakerBot:
 
     def _update_orders(self, new_bids: List[Dict[str, Any]], new_asks: List[Dict[str, Any]]):
         """
-        Reconciles active orders with the new target quote (ladder) from the strategy,
-        checking both price and size for changes.
+        Reconciles active orders with the new target quote ladder from the strategy,
+        using a dynamic tolerance based on queue position to decide whether to re-quote.
         """
-        # --- Create a map of target quotes for efficient lookup: {price: size} ---
+        # Create a map of target quotes for efficient lookup: {price: size}
         target_bids_map = {q['price']: q['size'] for q in new_bids}
         target_asks_map = {q['price']: q['size'] for q in new_asks}
-        
-        # Define a tolerance for size changes to prevent flickering
-        size_tolerance = 10 
 
         # --- Reconcile Bids ---
-        # Cancel bids that are no longer in our target ladder or have the wrong size
+        # First, check existing orders to see if they should be kept or canceled.
         for order_id, order in list(self.active_bids.items()):
-            should_be_cancelled = False
-            if order['price'] not in target_bids_map:
-                # Cancel if the price is no longer in our target ladder
-                should_be_cancelled = True
-            elif abs(order['size'] - target_bids_map[order['price']]) > size_tolerance:
-                # Cancel if the size is significantly different from our new target size
-                should_be_cancelled = True
+            should_cancel = False
+            
+            # Check if the order's price is still in our target ladder
+            if order['price'] in target_bids_map:
+                # If the price is correct, check if the size is significantly different.
+                # To do this, we ask the strategy for the appropriate tolerance.
+                tolerance = self.strategy.get_size_tolerance(self.order_book, order)
+                target_size = target_bids_map[order['price']]
                 
-            if should_be_cancelled:
+                if order['size'] > 0: # Avoid division by zero
+                    size_diff_pct = abs(order['size'] - target_size) / order['size']
+                    if size_diff_pct > tolerance:
+                        # The size discrepancy is too large, so we should re-quote.
+                        should_cancel = True
+                # If the size difference is within tolerance, we do nothing to keep our queue priority.
+            else:
+                # The price is no longer optimal, so we must cancel.
+                should_cancel = True
+            
+            if should_cancel:
                 self._cancel_order(order_id)
                 if order_id in self.active_bids: del self.active_bids[order_id]
         
-        # Place new bids for price levels where we don't have an order
+        # Now, place new bids for any target price levels where we don't have an order.
         active_bid_prices = {o['price'] for o in self.active_bids.values()}
-        for price, size in target_bids_map.items():
-            if price not in active_bid_prices and self.inventory_position < POSITION_LIMIT:
-                order_id = self._place_order("BUY", price, size)
+        for quote in new_bids:
+            if quote['price'] not in active_bid_prices and self.inventory_position < POSITION_LIMIT:
+                # When placing, we record the volume ahead of us in the queue.
+                volume_ahead = sum(s for p, s in self.order_book.bids.items() if -p >= quote['price'])
+                order_id = self._place_order("BUY", quote['price'], quote['size'])
                 if order_id:
-                    self.active_bids[order_id] = {'price': price, 'size': size}
+                    self.active_bids[order_id] = {'price': quote['price'], 'size': quote['size'], 'volume_ahead': volume_ahead}
 
         # --- Symmetrical Logic for Asks ---
         for order_id, order in list(self.active_asks.items()):
-            should_be_cancelled = False
-            if order['price'] not in target_asks_map:
-                should_be_cancelled = True
-            elif abs(order['size'] - target_asks_map[order['price']]) > size_tolerance:
-                should_be_cancelled = True
+            should_cancel = False
+            if order['price'] in target_asks_map:
+                tolerance = self.strategy.get_size_tolerance(self.order_book, order)
+                target_size = target_asks_map[order['price']]
+                if order['size'] > 0:
+                    size_diff_pct = abs(order['size'] - target_size) / order['size']
+                    if size_diff_pct > tolerance:
+                        should_cancel = True
+            else:
+                should_cancel = True
             
-            if should_be_cancelled:
+            if should_cancel:
                 self._cancel_order(order_id)
                 if order_id in self.active_asks: del self.active_asks[order_id]
 
         active_ask_prices = {o['price'] for o in self.active_asks.values()}
-        for price, size in target_asks_map.items():
-            if price not in active_ask_prices and self.inventory_position > -POSITION_LIMIT:
-                order_id = self._place_order("SELL", price, size)
+        for quote in new_asks:
+            if quote['price'] not in active_ask_prices and self.inventory_position > -POSITION_LIMIT:
+                volume_ahead = sum(s for p, s in self.order_book.asks.items() if p <= quote['price'])
+                order_id = self._place_order("SELL", quote['price'], quote['size'])
                 if order_id:
-                    self.active_asks[order_id] = {'price': price, 'size': size}
+                    self.active_asks[order_id] = {'price': quote['price'], 'size': quote['size'], 'volume_ahead': volume_ahead}
 
     def _check_fills(self, trade: dict):
         """
@@ -289,7 +306,11 @@ class MarketMakerBot:
 
     def _place_order(self, side: str, price: float, size: float) -> int | None:
         """Delegates order placement to the execution client."""
-        return self.execution_client.place_order(side, price, size)
+        # For a simulation, we pass the current order book for queue analysis
+        if isinstance(self.execution_client, SimulatedExchange):
+            return self.execution_client.place_order(side, price, size, self.order_book)
+        else: # For a live client
+            return self.execution_client.place_order(side, price, size)
 
     def _cancel_order(self, order_id: int):
         """Delegates order cancellation to the execution client."""
