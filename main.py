@@ -70,7 +70,8 @@ def main():
         max_size_tolerance_pct=0.80,
         min_size_tolerance_pct=0.20,
         patience_depth_factor=0.8,
-        book_depth_ma_window=100
+        book_depth_ma_window=100,
+        liquidity_fraction=0.7
     )
 
     simulated_orders_list = []
@@ -84,7 +85,9 @@ def main():
         market_id=market_id,
         strategy=strategy,
         execution_client=execution_client,
-        base_order_value=100.0,
+        total_capital=2000.0,
+        order_value_percentage=0.05,
+        minting_capital_fraction=0.5,
         simulated_fills=simulated_fills_list
     )
 
