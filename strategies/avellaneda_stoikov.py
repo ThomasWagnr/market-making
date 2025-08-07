@@ -50,8 +50,10 @@ class AvellanedaStoikovStrategy(BaseStrategy):
         self.max_size_tolerance_pct = max_size_tolerance_pct
         self.min_size_tolerance_pct = min_size_tolerance_pct
         self.patience_depth_factor = patience_depth_factor
+        self.liquidity_fraction = liquidity_fraction
         self.book_depth_history = deque(maxlen=book_depth_ma_window)
         self.mid_price_history = deque(maxlen=lookback_period)
+        self.inventory_skew_intensity = 0.0
 
     def _estimate_liquidity(self, order_book: OrderBook) -> float:
         """
@@ -158,8 +160,15 @@ class AvellanedaStoikovStrategy(BaseStrategy):
         size_layer_1 = min(total_size, available_liquidity * self.liquidity_fraction)
         
         # Place the first layer if its size is meaningful
-        if size_layer_1 >= order_book.min_order_size: # Assuming bot passes order_book which has min_order_size
-            quotes.append({'price': self._round_to_tick(best_price, tick_size), 'size': round(size_layer_1, 2)})
+        if size_layer_1 >= 1e-9:
+            p = self._round_bid(best_price, tick_size) if side == "BUY" else self._round_ask(best_price, tick_size)
+            if side == "BUY" and order_book.best_ask is not None and p >= order_book.best_ask:
+                p = self._round_bid(order_book.best_ask - tick_size, tick_size)
+                p = max(0.0, p)
+            elif side == "SELL" and order_book.best_bid is not None and p <= order_book.best_bid:
+                p = self._round_ask(order_book.best_bid + tick_size, tick_size)
+                p = min(1.0, p)
+            quotes.append({'price': p, 'size': round(size_layer_1, 2)})
 
         # --- Deeper Layers: Distribute the Remainder ---
         remaining_size = total_size - size_layer_1
@@ -182,21 +191,28 @@ class AvellanedaStoikovStrategy(BaseStrategy):
                     current_price += self.layer_price_step * tick_size
 
                 size_for_this_layer = min(remaining_size, size_per_deeper_layer)
-                if size_for_this_layer >= order_book.min_order_size:
-                    quotes.append({'price': self._round_to_tick(current_price, tick_size), 'size': round(size_for_this_layer, 2)})
+                if size_for_this_layer >=1e-9:
+                    p = self._round_bid(current_price, tick_size) if side == "BUY" else self._round_ask(current_price, tick_size)
+                    if side == "BUY":
+                        if order_book.best_ask is not None and p >= order_book.best_ask:
+                            p = self._round_bid(order_book.best_ask - tick_size, tick_size)
+                        p = max(0.0, p)
+                    else:
+                        if order_book.best_bid is not None and p <= order_book.best_bid:
+                            p = self._round_ask(order_book.best_bid + tick_size, tick_size)
+                        p = min(1.0, p)
+                    quotes.append({'price': p, 'size': round(size_for_this_layer, 2)})
                 remaining_size -= size_for_this_layer
         
         return quotes
     
     def calculate_quotes(self, order_book: OrderBook, inventory_position: float, 
                          time_horizon: float, total_bid_size: float, total_ask_size: float) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-        
         mid_price = order_book.mid_price
         if mid_price is None:
             return [], []
 
         self.mid_price_history.append(mid_price)
-
         if len(self.mid_price_history) < self.lookback_period:
             logger.info(f"Strategy warming up. Data collected: {len(self.mid_price_history)}/{self.lookback_period}")
             return [], []
@@ -208,29 +224,36 @@ class AvellanedaStoikovStrategy(BaseStrategy):
 
         k = self._estimate_liquidity(order_book)
         skew = self._calculate_trend_skew() if self.enable_trend_skew else 0.0
-
         inventory_term = inventory_position * self.gamma * effective_volatility**2 * time_horizon
-        reservation_price = mid_price - inventory_term + skew
-
+        reservation_price = mid_price - inventory_term - (inventory_position * getattr(self, 'inventory_skew_intensity', 0.0)) + skew
         liquidity_term = math.log(1 + self.gamma / k)
         spread = self.gamma * effective_volatility**2 * time_horizon + (2 / self.gamma) * liquidity_term
-
-        best_bid_price = reservation_price - (spread / 2)
-        best_ask_price = reservation_price + (spread / 2)
-
-        if best_bid_price >= best_ask_price or best_bid_price < 0 or best_ask_price > 1:
+        
+        # Consolidated rounding and cross-prevention logic
+        ideal_bid = reservation_price - (spread / 2)
+        ideal_ask = reservation_price + (spread / 2)
+        final_bid = self._round_bid(ideal_bid, order_book.tick_size)
+        final_ask = self._round_ask(ideal_ask, order_book.tick_size)
+        if order_book.best_ask is not None and final_bid >= order_book.best_ask:
+            final_bid = self._round_bid(order_book.best_ask - order_book.tick_size, order_book.tick_size)
+        if order_book.best_bid is not None and final_ask <= order_book.best_bid:
+            final_ask = self._round_ask(order_book.best_bid + order_book.tick_size, order_book.tick_size)
+        if final_bid >= final_ask or final_bid < 0 or final_ask > 1:
             return [], []
 
         if self.enable_layering:
-            bid_quotes = self._create_quote_ladder(total_bid_size, best_bid_price, "BUY", order_book.tick_size, order_book)
-            ask_quotes = self._create_quote_ladder(total_ask_size, best_ask_price, "SELL", order_book.tick_size, order_book)
+            bid_quotes = self._create_quote_ladder(total_bid_size, final_bid, "BUY", order_book.tick_size, order_book)
+            ask_quotes = self._create_quote_ladder(total_ask_size, final_ask, "SELL", order_book.tick_size, order_book)
         else:
-            bid_quotes = [{'price': self._round_to_tick(best_bid_price, order_book.tick_size), 'size': total_bid_size}]
-            ask_quotes = [{'price': self._round_to_tick(best_ask_price, order_book.tick_size), 'size': total_ask_size}]
-        
+            bid_quotes = [{'price': final_bid, 'size': total_bid_size}]
+            ask_quotes = [{'price': final_ask, 'size': total_ask_size}]
+
         return bid_quotes, ask_quotes
 
-    def _round_to_tick(self, price: float, tick_size: float) -> float:
-        """Rounds a price to the nearest valid tick size for the market."""
+    def _round_bid(self, price: float, tick_size: float) -> float:
         if tick_size <= 0: return price
-        return round(price / tick_size) * tick_size
+        return math.floor(price / tick_size) * tick_size
+
+    def _round_ask(self, price: float, tick_size: float) -> float:
+        if tick_size <= 0: return price
+        return math.ceil(price / tick_size) * tick_size    
