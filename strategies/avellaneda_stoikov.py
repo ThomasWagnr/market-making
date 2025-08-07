@@ -2,6 +2,7 @@ import math
 import numpy as np
 import pandas as pd
 from collections import deque
+from datetime import datetime, timezone
 from scipy.stats import linregress
 from typing import List, Dict, Any, Tuple
 import logging
@@ -34,7 +35,9 @@ class AvellanedaStoikovStrategy(BaseStrategy):
                 min_size_tolerance_pct: float = 0.20,
                 patience_depth_factor: float = 0.8,
                 book_depth_ma_window: int = 100,
-                liquidity_fraction: float = 0.7):
+                liquidity_fraction: float = 0.7,
+                lookback_window_seconds: int = 120,
+                ewma_halflife_seconds: float = 30.0):
 
         self.gamma = gamma
         self.lookback_period = lookback_period
@@ -54,6 +57,10 @@ class AvellanedaStoikovStrategy(BaseStrategy):
         self.book_depth_history = deque(maxlen=book_depth_ma_window)
         self.mid_price_history = deque(maxlen=lookback_period)
         self.inventory_skew_intensity = 0.0
+        # Time-based volatility tracking
+        self.lookback_window_seconds = lookback_window_seconds
+        self.ewma_halflife_seconds = ewma_halflife_seconds
+        self.mid_price_time_history: deque[tuple[datetime, float]] = deque(maxlen=5000)
 
     def _estimate_liquidity(self, order_book: OrderBook) -> float:
         """
@@ -217,10 +224,26 @@ class AvellanedaStoikovStrategy(BaseStrategy):
             logger.info(f"Strategy warming up. Data collected: {len(self.mid_price_history)}/{self.lookback_period}")
             return [], []
 
-        price_series = pd.Series(list(self.mid_price_history))
-        price_changes = price_series.diff().dropna()
-        measured_volatility = price_changes.ewm(span=self.ewma_span).std().iloc[-1]
-        effective_volatility = max(measured_volatility, MINIMUM_VOLATILITY) if pd.notna(measured_volatility) else MINIMUM_VOLATILITY
+        # Build a time-indexed series for EWMA vol (time-based, not event-based)
+        now = datetime.now(timezone.utc)
+        self.mid_price_time_history.append((now, mid_price))
+        # Prune to lookback window
+        cutoff = now.timestamp() - float(self.lookback_window_seconds)
+        while self.mid_price_time_history and self.mid_price_time_history[0][0].timestamp() < cutoff:
+            self.mid_price_time_history.popleft()
+
+        if len(self.mid_price_time_history) >= 2:
+            times = [t for t, _ in self.mid_price_time_history]
+            prices = [p for _, p in self.mid_price_time_history]
+            ts_index = pd.to_datetime(times)
+            price_series = pd.Series(prices, index=ts_index)
+            price_changes = price_series.diff().dropna()
+            # Use halflife in seconds for continuous-time decay
+            halflife = pd.Timedelta(seconds=self.ewma_halflife_seconds)
+            measured_volatility = price_changes.ewm(halflife=halflife, times=price_changes.index).std().iloc[-1]
+            effective_volatility = max(float(measured_volatility), MINIMUM_VOLATILITY) if pd.notna(measured_volatility) else MINIMUM_VOLATILITY
+        else:
+            effective_volatility = MINIMUM_VOLATILITY
 
         k = self._estimate_liquidity(order_book)
         skew = self._calculate_trend_skew() if self.enable_trend_skew else 0.0
