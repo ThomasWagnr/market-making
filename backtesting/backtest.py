@@ -15,8 +15,10 @@ from market_maker_bot import MarketMakerBot
 from strategies.avellaneda_stoikov import AvellanedaStoikovStrategy
 from backtesting.simulation_client import SimulatedExchange
 from backtesting.analytics import generate_performance_report
-from utils import get_market_tokens
+from utils import get_market_details
 from event_dispatcher import EventDispatcher
+from order_book import OrderBook
+from trade_history import TradeHistory
 
 # Configure logging for the backtest
 logging.basicConfig(
@@ -50,19 +52,25 @@ async def run_backtest(data_filepath: str, market_id: str, strategy_params: Dict
     # 2. Perform the bot's async startup logic to get token IDs and set up the dispatcher
     logger.info("Fetching token IDs for backtest setup...")
     async with aiohttp.ClientSession() as session:
-        tokens = await get_market_tokens(session, market_id)
-        if not tokens:
+        market_details = await get_market_details(session, market_id)
+        if not market_details:
             logger.critical("Could not fetch token IDs for backtest. Aborting.")
             return
-        bot.yes_token_id, bot.no_token_id = tokens
+        
+        bot.yes_token_id = market_details['yes_token_id']
+        bot.no_token_id = market_details['no_token_id']
+        bot.market_close_time = market_details['close_time']
+        bot.min_order_size = market_details['min_order_size']
+        tick_size = market_details['min_tick_size']
 
-    # Manually initialize the dispatcher, just like the live bot does in its run() method
-    bot.dispatcher = EventDispatcher(
-        primary_order_book=bot.order_book,
-        primary_asset_id=bot.yes_token_id,
-        trade_history=bot.trade_history,
-        update_callback=bot._on_update
-    )
+        bot.order_book = OrderBook(bot.market_id, tick_size=tick_size)
+        bot.trade_history = TradeHistory(bot.market_id)
+        bot.dispatcher = EventDispatcher(
+            primary_order_book=bot.order_book,
+            primary_asset_id=bot.yes_token_id,
+            trade_history=bot.trade_history,
+            update_callback=bot._on_update
+        )
     
     # 3. The Simulation Engine (Event Loop)
     logger.info(f"Loading and processing data from {data_filepath}...")
@@ -143,19 +151,27 @@ if __name__ == '__main__':
     # These are the knobs you will tune to optimize your strategy
     strategy_config = {
         'gamma': 10.0,
-        'lookback_period': 100,
-        'ewma_span': 50,
+        'lookback_period': 20,
+        'ewma_span': 20,
         'enable_trend_skew': True,
         'enable_layering': True,
         'trend_window': 20,
         'max_skew': 0.005,
         'k_scaling_factor': 10.0,
-        'layer_price_step': 2,
+        'layer_price_step': 1,
         'layer_size_ratio': 1.5,
-        'max_layers': 5
+        'max_layers': 3,
+        'max_size_tolerance_pct': 0.80,
+        'min_size_tolerance_pct': 0.20,
+        'patience_depth_factor': 0.8,
+        'book_depth_ma_window': 100,
+        'liquidity_fraction': 0.7
     }
+    
     bot_config = {
-        'base_order_value': 500.0
+        'total_capital': 2000.0,
+        'minting_capital_fraction': 0.5,
+        'order_value_percentage': 0.05
     }
     
     # Run the backtest
