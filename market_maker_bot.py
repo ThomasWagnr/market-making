@@ -19,7 +19,6 @@ from backtesting.simulation_client import SimulatedExchange
 logger = logging.getLogger(__name__)
 
 WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
-POSITION_LIMIT = 1500.0
 
 class MarketMakerBot:
     """A generic bot runner that operates using a provided strategy module."""
@@ -28,7 +27,9 @@ class MarketMakerBot:
                  market_id: str,
                  strategy: BaseStrategy,
                  execution_client: ExecutionClient,
-                 base_order_value: float = 100.0,
+                 total_capital: float = 2000.0,
+                 minting_capital_fraction: float = 0.5,
+                 order_value_percentage: float = 0.05,
                  simulated_fills: List[Dict[str, Any]] = None):
 
         # --- Configuration ---
@@ -37,9 +38,15 @@ class MarketMakerBot:
         self.yes_token_id: Optional[str] = None
         self.no_token_id: Optional[str] = None
         self.strategy = strategy
-        self.base_order_value = base_order_value
         self.execution_client = execution_client
         self.is_running = True
+
+        # --- NEW: Capital Allocation ---
+        self.total_capital = total_capital
+        self.order_value_percentage = order_value_percentage
+        self.target_order_value = self.total_capital * self.order_value_percentage # The desired value of each quote
+        self.starting_shares = self.total_capital * minting_capital_fraction # e.g., $1000 = 1000 YES and 1000 NO shares
+        self.cash = self.total_capital - self.starting_shares # The other $1000 is for trading
 
         # --- Reporting & Simulation ---
         self.simulated_fills = simulated_fills if simulated_fills is not None else []
@@ -47,8 +54,7 @@ class MarketMakerBot:
         # --- Performance Tracking ---
         self.realized_pnl = 0.0
         self.unrealized_pnl = 0.0
-        self.cash = 10000.0
-        self.total_value = self.cash
+        self.total_value = self.total_capital
         self.average_entry_price = 0.0
         
         # --- Live State ---
@@ -67,20 +73,44 @@ class MarketMakerBot:
         self.trade_history: Optional[TradeHistory] = None
         self.dispatcher: Optional[EventDispatcher] = None
 
+        # --- Retry/Backoff Configuration ---
+        self.initial_retry_delay = 1
+        self.max_retry_delay = 32
+        self.retry_multiplier = 2.0
+
+        # --- Queue tracking caches (optimized incremental refresh) ---
+        # Book last-seen sizes per exact price
+        self._book_bids_size: Dict[float, float] = {}
+        self._book_asks_size: Dict[float, float] = {}
+        # Our own size aggregated per price
+        self._our_bids_by_price: Dict[float, float] = {}
+        self._our_asks_by_price: Dict[float, float] = {}
+        # Better volume caches per our active price
+        self._better_vol_at_bid_price: Dict[float, float] = {}
+        self._better_vol_at_ask_price: Dict[float, float] = {}
+
     def _on_update(self, event_type: str, data: dict):
         """Core trigger, called by the dispatcher after any data update."""
 
         if not self.is_running:
             return
 
+        # In backtests, the SimulatedExchange drives fills; avoid double-counting here.
         if event_type == "last_trade_price":
-            self._check_fills(data)
+            if not isinstance(self.execution_client, SimulatedExchange):
+                self._check_fills(data)
+
+        # Maintain queue positions/cache on book updates
+        if event_type == "price_change":
+            self._refresh_queue_positions(data.get("changes", []))
+        elif event_type == "book":
+            self._rebuild_queue_caches()
 
         self._update_pnl()
 
         total_bid_size, total_ask_size = self._calculate_order_sizes()
 
-        # 2. Delegate quote calculation to the strategy module
+        # Delegate quote calculation to the strategy module
         new_bids, new_asks = self.strategy.calculate_quotes(
             order_book=self.order_book,
             inventory_position=self.inventory_position,
@@ -89,57 +119,69 @@ class MarketMakerBot:
             total_ask_size=total_ask_size
         )
 
-        # 3. Print current state to the console
         state_str = (f"{self.order_book} | Inv: {self.inventory_position:+.1f} | "
                      f"P&L: ${self.realized_pnl:+.2f} | Equity: ${self.total_value:,.2f}")
         print(f"\r{state_str}", end="", flush=True)
 
-        # 4. Update orders on the exchange based on the strategy's decision
         if new_bids or new_asks:
             self._update_orders(new_bids, new_asks)
         else:
             self._cancel_all_orders()
+            
 
     def _update_pnl(self):
         """Calculates unrealized P&L and total equity."""
-        if not self.order_book.best_bid or not self.order_book.best_ask:
+        mid_price = self.order_book.mid_price
+        if not mid_price:
             return
+        
+        # 1. Calculate the market value of our TRADED inventory
+        market_value_of_traded_inventory = self.inventory_position * mid_price
+        
+        # 2. The capital used to mint our starting shares is always worth its original value
+        value_of_minted_assets = self.starting_shares
 
-        mid_price = (self.order_book.best_bid + self.order_book.best_ask) / 2
+        # 3. The correct total equity is the sum of our cash, our minted assets, and our traded assets
+        self.total_value = self.cash + value_of_minted_assets + market_value_of_traded_inventory
         
-        # Calculate the market value of our current inventory
-        market_value = self.inventory_position * mid_price
-        
-        # Calculate unrealized P&L if we hold a position
+        # 4. Unrealized P&L is the gain/loss on the TRADED portion of our inventory
         if self.inventory_position != 0:
             cost_basis = self.inventory_position * self.average_entry_price
-            self.unrealized_pnl = market_value - cost_basis
+            self.unrealized_pnl = market_value_of_traded_inventory - cost_basis
         else:
             self.unrealized_pnl = 0.0
-        
-        # Total equity is our cash plus the current market value of our assets
-        self.total_value = self.cash + market_value
 
     def _calculate_order_sizes(self) -> tuple[float, float]:
         """
-        Calculates the total target order size for each side based on
-        base value and inventory skew. The strategy is responsible for layering.
+        Calculates the total target order sizes for each side, constrained by
+        the bot's actual share inventory and available cash.
         """
         mid_price = self.order_book.mid_price
         if not mid_price or mid_price <= 1e-9:
-            return 0.0, 0.0 # Return zero if we can't calculate
+            return 0.0, 0.0
 
-        # 1. Calculate a base size in shares from our target capital
-        base_size = self.base_order_value / mid_price
+        # 1. Determine the ideal size based on our target capital per quote
+        ideal_size = self.target_order_value / mid_price
 
-        # 2. Apply inventory skew
-        inventory_factor_buy = 1.0 - (self.inventory_position / POSITION_LIMIT)
-        inventory_factor_sell = 1.0 + (self.inventory_position / POSITION_LIMIT)
+        # 2. Determine the HARD LIMITS based on our actual capital
+        # Max we can sell is the number of YES shares we currently own
+        # Inventory is long YES shares, so positive inventory adds to what we can sell.
+        max_sellable_shares = self.starting_shares - self.inventory_position
         
-        total_bid_size = base_size * inventory_factor_buy
-        total_ask_size = base_size * inventory_factor_sell
+        # Max we can buy is what our cash can afford
+        max_buyable_shares = self.cash / mid_price
 
-        # 3. Ensure the total size is not below the market minimum
+        # 3. Calculate final sizes, respecting inventory skew AND hard limits
+        # The old inventory factors now represent our desire to trade, not the limit itself.
+        inventory_factor_buy = 1.0 - (self.inventory_position / self.starting_shares)
+        inventory_factor_sell = 1.0 + (self.inventory_position / self.starting_shares)
+        
+        # The total size we quote is our ideal size, skewed by inventory,
+        # but capped by our absolute capital limits.
+        total_bid_size = min(ideal_size * inventory_factor_buy, max_buyable_shares)
+        total_ask_size = min(ideal_size * inventory_factor_sell, max_sellable_shares)
+
+        # 4. Ensure sizes are not below the market minimum
         final_bid_size = total_bid_size if total_bid_size >= self.min_order_size else 0.0
         final_ask_size = total_ask_size if total_ask_size >= self.min_order_size else 0.0
         
@@ -177,18 +219,43 @@ class MarketMakerBot:
                 should_cancel = True
             
             if should_cancel:
+                # Adjust our per-price aggregate before deletion
+                if order_id in self.active_bids:
+                    price = self.active_bids[order_id]['price']
+                    remaining = self.active_bids[order_id]['size']
+                    self._our_bids_by_price[price] = max(0.0, self._our_bids_by_price.get(price, 0.0) - remaining)
                 self._cancel_order(order_id)
                 if order_id in self.active_bids: del self.active_bids[order_id]
         
         # Now, place new bids for any target price levels where we don't have an order.
         active_bid_prices = {o['price'] for o in self.active_bids.values()}
         for quote in new_bids:
-            if quote['price'] not in active_bid_prices and self.inventory_position < POSITION_LIMIT:
-                # When placing, we record the volume ahead of us in the queue.
-                volume_ahead = sum(s for p, s in self.order_book.bids.items() if -p >= quote['price'])
-                order_id = self._place_order("BUY", quote['price'], quote['size'])
+            if quote['price'] not in active_bid_prices and quote['size'] >= self.min_order_size:
+                # Compute baseline components at placement time
+                price = quote['price']
+                size = quote['size']
+                better_vol = sum(s for p, s in self.order_book.bids.items() if -p > price)
+                book_at_price = self.order_book.bids.get(-price, 0.0)
+                our_total_at_price = sum(o['size'] for o in self.active_bids.values() if o['price'] == price)
+                equal_other_vol = max(0.0, book_at_price - our_total_at_price)
+                our_prior_vol = our_total_at_price  # orders already present at this price are prior
+
+                # Place order via execution client
+                order_id = self._place_order("BUY", price, size)
                 if order_id:
-                    self.active_bids[order_id] = {'price': quote['price'], 'size': quote['size'], 'volume_ahead': volume_ahead}
+                    volume_ahead = better_vol + equal_other_vol + our_prior_vol
+                    self.active_bids[order_id] = {
+                        'price': price,
+                        'size': size,
+                        'volume_ahead': volume_ahead,
+                        'baseline_equal_other_vol': equal_other_vol,
+                        'baseline_our_prior_vol': our_prior_vol,
+                    }
+                    # Update caches for incremental refresh
+                    self._our_bids_by_price[price] = self._our_bids_by_price.get(price, 0.0) + size
+                    if price not in self._better_vol_at_bid_price:
+                        self._better_vol_at_bid_price[price] = better_vol
+                    self._book_bids_size[price] = book_at_price
 
         # --- Symmetrical Logic for Asks ---
         for order_id, order in list(self.active_asks.items()):
@@ -204,16 +271,38 @@ class MarketMakerBot:
                 should_cancel = True
             
             if should_cancel:
+                if order_id in self.active_asks:
+                    price = self.active_asks[order_id]['price']
+                    remaining = self.active_asks[order_id]['size']
+                    self._our_asks_by_price[price] = max(0.0, self._our_asks_by_price.get(price, 0.0) - remaining)
                 self._cancel_order(order_id)
                 if order_id in self.active_asks: del self.active_asks[order_id]
 
         active_ask_prices = {o['price'] for o in self.active_asks.values()}
         for quote in new_asks:
-            if quote['price'] not in active_ask_prices and self.inventory_position > -POSITION_LIMIT:
-                volume_ahead = sum(s for p, s in self.order_book.asks.items() if p <= quote['price'])
-                order_id = self._place_order("SELL", quote['price'], quote['size'])
+            if quote['price'] not in active_ask_prices and quote['size'] >= self.min_order_size:
+                price = quote['price']
+                size = quote['size']
+                better_vol = sum(s for p, s in self.order_book.asks.items() if p < price)
+                book_at_price = self.order_book.asks.get(price, 0.0)
+                our_total_at_price = sum(o['size'] for o in self.active_asks.values() if o['price'] == price)
+                equal_other_vol = max(0.0, book_at_price - our_total_at_price)
+                our_prior_vol = our_total_at_price
+
+                order_id = self._place_order("SELL", price, size)
                 if order_id:
-                    self.active_asks[order_id] = {'price': quote['price'], 'size': quote['size'], 'volume_ahead': volume_ahead}
+                    volume_ahead = better_vol + equal_other_vol + our_prior_vol
+                    self.active_asks[order_id] = {
+                        'price': price,
+                        'size': size,
+                        'volume_ahead': volume_ahead,
+                        'baseline_equal_other_vol': equal_other_vol,
+                        'baseline_our_prior_vol': our_prior_vol,
+                    }
+                    self._our_asks_by_price[price] = self._our_asks_by_price.get(price, 0.0) + size
+                    if price not in self._better_vol_at_ask_price:
+                        self._better_vol_at_ask_price[price] = better_vol
+                    self._book_asks_size[price] = book_at_price
 
     def _check_fills(self, trade: dict):
         """
@@ -339,6 +428,115 @@ class MarketMakerBot:
             self._cancel_order(order_id)
         self.active_asks.clear()
 
+    def _refresh_queue_positions(self, changes: List[Dict[str, Any]]):
+        """Incrementally updates queue positions using deltas from price_change events.
+
+        - Maintains book size maps and better-volume caches per our active prices
+        - Recomputes only affected price buckets
+        - Does not count new arrivals at our price as ahead (caps equal-price others at baseline)
+        """
+        if not self.order_book or not changes:
+            return
+
+        touched_bid_prices: set[float] = set()
+        touched_ask_prices: set[float] = set()
+
+        # 1) Update last-seen book size maps and better-volume caches via deltas
+        for ch in changes:
+            side = ch.get('side', '').upper()
+            price = float(ch.get('price'))
+            new_size = float(ch.get('size'))
+            if side == 'BUY':
+                prev = self._book_bids_size.get(price, 0.0)
+                delta = new_size - prev
+                if delta != 0.0:
+                    # update better volume cache for all our bid prices lower than this price
+                    for p in list(self._better_vol_at_bid_price.keys()):
+                        if p < price:
+                            self._better_vol_at_bid_price[p] = max(0.0, self._better_vol_at_bid_price[p] + delta)
+                    self._book_bids_size[price] = new_size
+                    # any order at this price or below may be affected
+                    touched_bid_prices.update([p for p in self._better_vol_at_bid_price.keys() if p <= price])
+                    touched_bid_prices.add(price)
+            elif side == 'SELL':
+                prev = self._book_asks_size.get(price, 0.0)
+                delta = new_size - prev
+                if delta != 0.0:
+                    for p in list(self._better_vol_at_ask_price.keys()):
+                        if p > price:
+                            self._better_vol_at_ask_price[p] = max(0.0, self._better_vol_at_ask_price[p] + delta)
+                    self._book_asks_size[price] = new_size
+                    touched_ask_prices.update([p for p in self._better_vol_at_ask_price.keys() if p >= price])
+                    touched_ask_prices.add(price)
+
+        # 2) Recompute per-order volume_ahead only for touched prices
+        # Bids
+        if touched_bid_prices:
+            bids_by_price: Dict[float, List[tuple[int, Dict[str, Any]]]] = {}
+            for oid, order in self.active_bids.items():
+                if order['price'] in touched_bid_prices:
+                    bids_by_price.setdefault(order['price'], []).append((oid, order))
+            for price, orders in bids_by_price.items():
+                orders.sort(key=lambda x: x[0])
+                better_vol = self._better_vol_at_bid_price.get(price)
+                if better_vol is None:
+                    # initialize from book if missing
+                    better_vol = sum(s for p, s in self.order_book.bids.items() if -p > price)
+                    self._better_vol_at_bid_price[price] = better_vol
+                book_at_price = self._book_bids_size.get(price, 0.0)
+                our_total_at_price = self._our_bids_by_price.get(price, 0.0)
+                baseline_equal_other = max(0.0, book_at_price - our_total_at_price)
+                cumulative_our_prior = 0.0
+                for oid, order in orders:
+                    equal_other_vol = min(baseline_equal_other, order.get('baseline_equal_other_vol', baseline_equal_other))
+                    order['volume_ahead'] = max(0.0, better_vol) + equal_other_vol + cumulative_our_prior
+                    cumulative_our_prior += max(0.0, order['size'])
+
+        # Asks
+        if touched_ask_prices:
+            asks_by_price: Dict[float, List[tuple[int, Dict[str, Any]]]] = {}
+            for oid, order in self.active_asks.items():
+                if order['price'] in touched_ask_prices:
+                    asks_by_price.setdefault(order['price'], []).append((oid, order))
+            for price, orders in asks_by_price.items():
+                orders.sort(key=lambda x: x[0])
+                better_vol = self._better_vol_at_ask_price.get(price)
+                if better_vol is None:
+                    better_vol = sum(s for p, s in self.order_book.asks.items() if p < price)
+                    self._better_vol_at_ask_price[price] = better_vol
+                book_at_price = self._book_asks_size.get(price, 0.0)
+                our_total_at_price = self._our_asks_by_price.get(price, 0.0)
+                baseline_equal_other = max(0.0, book_at_price - our_total_at_price)
+                cumulative_our_prior = 0.0
+                for oid, order in orders:
+                    equal_other_vol = min(baseline_equal_other, order.get('baseline_equal_other_vol', baseline_equal_other))
+                    order['volume_ahead'] = max(0.0, better_vol) + equal_other_vol + cumulative_our_prior
+                    cumulative_our_prior += max(0.0, order['size'])
+
+    def _rebuild_queue_caches(self):
+        """Rebuilds book and better-volume caches from a full snapshot."""
+        if not self.order_book:
+            return
+        # Rebuild book maps from order_book structures
+        self._book_bids_size = { -p: s for p, s in self.order_book.bids.items() }
+        self._book_asks_size = { p: s for p, s in self.order_book.asks.items() }
+        # Rebuild our per-price aggregates
+        self._our_bids_by_price.clear()
+        for o in self.active_bids.values():
+            self._our_bids_by_price[o['price']] = self._our_bids_by_price.get(o['price'], 0.0) + o['size']
+        self._our_asks_by_price.clear()
+        for o in self.active_asks.values():
+            self._our_asks_by_price[o['price']] = self._our_asks_by_price.get(o['price'], 0.0) + o['size']
+        # Recompute better volume cache for our active prices only
+        self._better_vol_at_bid_price = {
+            price: sum(s for p, s in self.order_book.bids.items() if -p > price)
+            for price in {o['price'] for o in self.active_bids.values()}
+        }
+        self._better_vol_at_ask_price = {
+            price: sum(s for p, s in self.order_book.asks.items() if p < price)
+            for price in {o['price'] for o in self.active_asks.values()}
+        }
+
 
     async def _decrement_time(self):
         """Dynamically calculates the time horizon based on the market's actual close time."""
@@ -358,6 +556,8 @@ class MarketMakerBot:
     async def run(self):
         """The main run loop that connects to the WebSocket and processes messages."""
         logger.info("Starting bot for market: %s", self.market_id)
+
+        current_retry_delay = self.initial_retry_delay
 
         async with aiohttp.ClientSession() as session:
             # --- Fetch market info on startup ---
@@ -401,6 +601,7 @@ class MarketMakerBot:
                     logger.info("Attempting to connect to WebSocket...")
                     async with websockets.connect(WS_URL, ping_interval=20) as ws:
                         logger.info("WebSocket connected for market %s.", self.market_id)
+                        current_retry_delay = self.initial_retry_delay
                         sub_msg = {"assets_ids": [self.yes_token_id, self.no_token_id], "type": "market"}
                         await ws.send(json.dumps(sub_msg))
                         logger.info("Subscribed to market updates of both YES and NO tokens. Listening...")
@@ -412,8 +613,9 @@ class MarketMakerBot:
 
                 except Exception as e:
                     logger.error("An unexpected error occurred in the run loop: %s", e, exc_info=True)
-                    logger.info("Retrying in 5s...")
-                    await asyncio.sleep(5)
+                    logger.info("Retrying in %d s...", current_retry_delay)
+                    await asyncio.sleep(current_retry_delay)
+                    current_retry_delay = min(self.max_retry_delay, current_retry_delay * self.retry_multiplier)
 
     def stop(self):
         """Signals the bot's main run loop to terminate."""
