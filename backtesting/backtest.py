@@ -144,9 +144,10 @@ async def run_backtest(data_filepath: str, market_id: str, strategy_params: Dict
         logger.critical(f"An error occurred during the simulation loop: {e}", exc_info=True)
         return
 
-    # 4. Generate the final performance report
+    # 4. Shutdown and liquidate any remaining inventory aggressively
     logger.info(f"Simulation loop complete. Processed {message_count} total messages.")
-    bot._update_pnl() # Final P&L calculation
+    await bot.shutdown()
+    bot._update_pnl() # Final P&L calculation after shutdown
     bot_final_state = {
         'realized_pnl': bot.realized_pnl,
         'unrealized_pnl': bot.unrealized_pnl,

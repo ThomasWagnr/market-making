@@ -661,23 +661,70 @@ class MarketMakerBot:
         if abs(self.inventory_position) > 1e-9:
             logger.warning("Bot has remaining inventory of %+.2f. Liquidating position...", self.inventory_position)
 
-            # If we are long, we need to sell immediately
+            # Snapshot book at submit
+            best_bid = self.order_book.best_bid
+            best_ask = self.order_book.best_ask
+            mid_at_submit = self.order_book.mid_price
+
             if self.inventory_position > 0:
-                if self.order_book.best_bid:
-                    price = self.order_book.best_bid
-                    size = self.inventory_position
-                    logger.info("Placing aggressive SELL order for %.2f @ %.3f", size, price)
-                    self._place_order("SELL", price, size)
+                # SELL aggressively into bids
+                target = self.inventory_position
+                filled, notional, levels = self.order_book.consume_from_bids(target)
+                if filled > 0:
+                    vwap = notional / filled
+                    slippage_best = (vwap - best_bid) if best_bid is not None else None
+                    slippage_mid = (vwap - mid_at_submit) if mid_at_submit is not None else None
+
+                    # Update state as if we sold 'filled' at vwap
+                    realized = 0.0
+                    if self.inventory_position > 0:
+                        close_sz = min(self.inventory_position, filled)
+                        realized += (vwap - self.average_entry_price) * close_sz
+                        self.inventory_position -= close_sz
+                        self.cash += close_sz * vwap
+                        if abs(self.inventory_position) < 1e-9:
+                            self.average_entry_price = 0.0
+                    # If any residual (should not happen here), ignore for now
+                    self.realized_pnl += realized
+                    self._update_pnl()
+
+                    logger.info(
+                        "Aggressive SELL: filled %.2f (VWAP %.4f) | slip_best=%.5f slip_mid=%.5f | levels=%d",
+                        filled, vwap,
+                        slippage_best if slippage_best is not None else float('nan'),
+                        slippage_mid if slippage_mid is not None else float('nan'),
+                        len(levels)
+                    )
                 else:
                     logger.error("Cannot liquidate long position: No buyers in the order book.")
-            
-            # If we are short, we need to buy back immediately
-            else: # self.inventory_position < 0
-                if self.order_book.best_ask:
-                    price = self.order_book.best_ask
-                    size = abs(self.inventory_position)
-                    logger.info("Placing aggressive BUY order for %.2f @ %.3f", size, price)
-                    self._place_order("BUY", price, size)
+
+            else:
+                # BUY aggressively from asks to cover short
+                target = abs(self.inventory_position)
+                filled, notional, levels = self.order_book.consume_from_asks(target)
+                if filled > 0:
+                    vwap = notional / filled
+                    slippage_best = (best_ask - vwap) if best_ask is not None else None
+                    slippage_mid = (mid_at_submit - vwap) if mid_at_submit is not None else None
+
+                    realized = 0.0
+                    if self.inventory_position < 0:
+                        close_sz = min(abs(self.inventory_position), filled)
+                        realized += (self.average_entry_price - vwap) * close_sz
+                        self.inventory_position += close_sz
+                        self.cash -= close_sz * vwap
+                        if abs(self.inventory_position) < 1e-9:
+                            self.average_entry_price = 0.0
+                    self.realized_pnl += realized
+                    self._update_pnl()
+
+                    logger.info(
+                        "Aggressive BUY: filled %.2f (VWAP %.4f) | slip_best=%.5f slip_mid=%.5f | levels=%d",
+                        filled, vwap,
+                        slippage_best if slippage_best is not None else float('nan'),
+                        slippage_mid if slippage_mid is not None else float('nan'),
+                        len(levels)
+                    )
                 else:
                     logger.error("Cannot liquidate short position: No sellers in the order book.")
         else:

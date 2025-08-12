@@ -161,6 +161,13 @@ def generate_performance_report(
             oss_df['timestamp'] = pd.to_datetime(oss_df['timestamp'], unit='s', errors='coerce')
             oss_df.sort_values('timestamp', inplace=True)
             oss_df.to_csv(os.path.join(output_dir, 'order_state_snapshots.csv'), index=False)
+
+        # Derive and save aggressive trade summary if fills include shutdown sweeps
+        if 'equity' in fills_df.columns and 'order_id' in fills_df.columns:
+            # Heuristic placeholder: in future, tag aggressive events explicitly
+            # For now, export last snapshot of equity and inventory for reference
+            summary_tail = fills_df.tail(1)
+            summary_tail.to_csv(os.path.join(output_dir, 'end_state.csv'), index=False)
         # Save summary
         summary = {
             'final_equity': float(final_equity),

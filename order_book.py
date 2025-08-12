@@ -88,3 +88,89 @@ class OrderBook:
         spread_str = f"{spread:.4f}" if spread is not None else "N/A"
         
         return f"Book State | Best Bid: {bid_str} | Best Ask: {ask_str} | Mid Price: {mid_price_str} | Spread: {spread_str}"
+
+    # --- Aggressive consumption helpers (slippage/impact modeling) ---
+    def consume_from_asks(self, target_size: float):
+        """
+        Aggressively buys from the ask book until target_size is filled or book exhausts.
+        Mutates the ask book in place.
+
+        Returns:
+            filled (float): total size filled
+            notional (float): total notional spent
+            levels (list[tuple[float, float]]): list of (price, size_filled) per level
+        """
+        if target_size <= 0:
+            return 0.0, 0.0, []
+
+        filled = 0.0
+        notional = 0.0
+        levels: list[tuple[float, float]] = []
+
+        # Iterate asks from best (lowest price) upwards
+        for price in list(self.asks.keys()):
+            if filled >= target_size:
+                break
+            available = float(self.asks.get(price, 0.0))
+            if available <= 0:
+                continue
+            take = min(available, target_size - filled)
+            if take <= 0:
+                continue
+            new_qty = available - take
+            if new_qty <= 0:
+                # Remove level
+                try:
+                    del self.asks[price]
+                except Exception:
+                    pass
+            else:
+                self.asks[price] = new_qty
+            filled += take
+            notional += take * price
+            levels.append((price, take))
+
+        return filled, notional, levels
+
+    def consume_from_bids(self, target_size: float):
+        """
+        Aggressively sells into the bid book until target_size is filled or book exhausts.
+        Mutates the bid book in place.
+
+        Returns:
+            filled (float): total size filled
+            notional (float): total notional received
+            levels (list[tuple[float, float]]): list of (price, size_filled) per level
+        """
+        if target_size <= 0:
+            return 0.0, 0.0, []
+
+        filled = 0.0
+        notional = 0.0
+        levels: list[tuple[float, float]] = []
+
+        # Iterate bids from best (highest price) downwards
+        # Bids are stored with negative price keys sorted ascending.
+        for neg_price in list(self.bids.keys()):
+            if filled >= target_size:
+                break
+            price = -neg_price
+            available = float(self.bids.get(neg_price, 0.0))
+            if available <= 0:
+                continue
+            take = min(available, target_size - filled)
+            if take <= 0:
+                continue
+            new_qty = available - take
+            if new_qty <= 0:
+                try:
+                    del self.bids[neg_price]
+                except Exception:
+                    pass
+            else:
+                self.bids[neg_price] = new_qty
+            filled += take
+            notional += take * price
+            levels.append((price, take))
+
+        return filled, notional, levels
