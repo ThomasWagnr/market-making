@@ -5,6 +5,7 @@ import os
 import json
 import gzip
 import logging
+from datetime import datetime, timezone
 import asyncio
 import aiohttp
 from typing import Dict
@@ -49,6 +50,7 @@ async def run_backtest(data_filepath: str, market_id: str, strategy_params: Dict
         strategy=strategy,
         execution_client=sim_exchange,
         simulated_fills=simulated_fills,
+        simulated_taker_trades=[],
         **bot_params
     )
     
@@ -78,12 +80,24 @@ async def run_backtest(data_filepath: str, market_id: str, strategy_params: Dict
     # 3. The Simulation Engine (Event Loop)
     logger.info(f"Loading and processing data from {data_filepath}...")
     message_count = 0
+    first_event_ts: float | None = None
     try:
         with gzip.open(data_filepath, 'rt') as f:
             for line in f:
                 log_entry = json.loads(line)
                 message_data = log_entry['data']
                 timestamp = log_entry['timestamp']
+
+                # Initialize backtest session timing on first event
+                if first_event_ts is None:
+                    first_event_ts = float(timestamp)
+                    bot.market_start_time = datetime.fromtimestamp(first_event_ts, tz=timezone.utc)
+                    session_secs = (bot.market_close_time - bot.market_start_time).total_seconds() if bot.market_close_time else 0.0
+                    if session_secs <= 0:
+                        logger.warning("Computed non-positive session duration (%.2f s). Using fallback of 1.0s.", session_secs)
+                        session_secs = 1.0
+                    bot.session_duration_seconds = session_secs
+                    bot.time_horizon = 1.0
                 
                 # Update the simulated exchange's internal clock
                 sim_exchange.set_time(timestamp)
@@ -92,7 +106,7 @@ async def run_backtest(data_filepath: str, market_id: str, strategy_params: Dict
                 
                 # Before the bot reacts, the exchange must process any trades from the message
                 for event in events:
-                    # Attach simulated time to every event
+                # Attach simulated time to every event
                     event["sim_time"] = timestamp
                     if event.get("event_type") == "last_trade_price":
                         sim_exchange.check_for_fills(event, bot._check_fills)
@@ -163,6 +177,7 @@ async def run_backtest(data_filepath: str, market_id: str, strategy_params: Dict
         output_dir=output_dir,
         book_snapshots=book_snapshots,
         order_state_snapshots=order_state_snapshots,
+        taker_trades=getattr(bot, 'simulated_taker_trades', None)
     )
 
 

@@ -22,6 +22,7 @@ def generate_performance_report(
     output_dir: Optional[str] = None,
     book_snapshots: Optional[List[Dict[str, Any]]] = None,
     order_state_snapshots: Optional[List[Dict[str, Any]]] = None,
+    taker_trades: Optional[List[Dict[str, Any]]] = None,
 ):
     """Calculates, prints, and optionally saves key performance metrics from a backtest run."""
     
@@ -185,3 +186,10 @@ def generate_performance_report(
             'generated_at': datetime.utcnow().isoformat() + 'Z',
         }
         pd.Series(summary).to_json(os.path.join(output_dir, 'summary.json'))
+
+        # Save taker trades if present
+        if taker_trades:
+            at_df = pd.DataFrame(taker_trades)
+            if 'timestamp' in at_df.columns:
+                at_df['timestamp'] = pd.to_datetime(at_df['timestamp'])
+            at_df.to_csv(os.path.join(output_dir, 'taker_trades.csv'), index=False)

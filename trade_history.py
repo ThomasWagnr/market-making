@@ -17,11 +17,18 @@ class TradeHistory:
         """
         Adds a new trade to the recent trades deque and the permanent log.
         """
+        # Prefer recorded sim_time if present for backtests
+        ts = data.get('sim_time') if isinstance(data, dict) else None
+        if isinstance(ts, (int, float)):
+            ts_dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+        else:
+            ts_dt = datetime.now(timezone.utc)
+
         trade_record = {
             'price': float(data['price']),
             'size': float(data['size']),
             'side': data['side'].upper(),
-            'timestamp': datetime.now(timezone.utc)
+            'timestamp': ts_dt
         }
 
         self.recent_trades.append(trade_record)

@@ -30,7 +30,8 @@ class MarketMakerBot:
                  total_capital: float = 2000.0,
                  minting_capital_fraction: float = 0.5,
                  order_value_percentage: float = 0.05,
-                 simulated_fills: List[Dict[str, Any]] = None):
+                 simulated_fills: List[Dict[str, Any]] = None,
+                 simulated_taker_trades: List[Dict[str, Any]] = None):
 
         # --- Configuration ---
         self.market_id = market_id
@@ -50,6 +51,7 @@ class MarketMakerBot:
 
         # --- Reporting & Simulation ---
         self.simulated_fills = simulated_fills if simulated_fills is not None else []
+        self.simulated_taker_trades = simulated_taker_trades if simulated_taker_trades is not None else []
 
         # --- Performance Tracking ---
         self.realized_pnl = 0.0
@@ -67,6 +69,7 @@ class MarketMakerBot:
         self.market_start_time: Optional[datetime] = None
         self.market_close_time: Optional[datetime] = None
         self.session_duration_seconds: float = 0.0
+        self._last_sim_time_epoch: Optional[float] = None
 
         # --- Component Initialization ---
         self.order_book: Optional[OrderBook] = None
@@ -105,6 +108,18 @@ class MarketMakerBot:
             self._refresh_queue_positions(data.get("changes", []))
         elif event_type == "book":
             self._rebuild_queue_caches()
+
+        # In backtests, update time_horizon using the recorded sim time
+        try:
+            sim_time = data.get('sim_time') if isinstance(data, dict) else None
+            if sim_time is not None and self.market_close_time and self.session_duration_seconds > 0:
+                now_dt = datetime.fromtimestamp(float(sim_time), tz=timezone.utc)
+                time_remaining = (self.market_close_time - now_dt).total_seconds()
+                self.time_horizon = max(0.0, time_remaining / self.session_duration_seconds)
+                # keep for shutdown timestamping
+                self._last_sim_time_epoch = float(sim_time)
+        except Exception:
+            pass
 
         self._update_pnl()
 
@@ -688,6 +703,34 @@ class MarketMakerBot:
                     self.realized_pnl += realized
                     self._update_pnl()
 
+                    # Log aggressive trade artifact and append synthetic fill
+                    ts_iso = (
+                        datetime.fromtimestamp(self._last_sim_time_epoch, tz=timezone.utc).isoformat()
+                        if isinstance(self._last_sim_time_epoch, (int, float)) else
+                        datetime.now(timezone.utc).isoformat()
+                    )
+                    self.simulated_taker_trades.append({
+                        'timestamp': ts_iso,
+                        'side': 'SELL',
+                        'requested_size': float(target),
+                        'filled_size': float(filled),
+                        'vwap': float(vwap),
+                        'slippage_vs_best': float(slippage_best) if slippage_best is not None else None,
+                        'slippage_vs_mid': float(slippage_mid) if slippage_mid is not None else None,
+                        'levels_touched': int(len(levels))
+                    })
+                    self.simulated_fills.append({
+                        'timestamp': ts_iso,
+                        'side': 'SELL',
+                        'price': float(vwap),
+                        'size': float(filled),
+                        'order_id': None,
+                        'equity': self.total_value,
+                        'inventory': self.inventory_position,
+                        'cash': self.cash,
+                        'exec_type': 'AGGRESSIVE_SWEEP'
+                    })
+
                     logger.info(
                         "Aggressive SELL: filled %.2f (VWAP %.4f) | slip_best=%.5f slip_mid=%.5f | levels=%d",
                         filled, vwap,
@@ -717,6 +760,33 @@ class MarketMakerBot:
                             self.average_entry_price = 0.0
                     self.realized_pnl += realized
                     self._update_pnl()
+
+                    ts_iso = (
+                        datetime.fromtimestamp(self._last_sim_time_epoch, tz=timezone.utc).isoformat()
+                        if isinstance(self._last_sim_time_epoch, (int, float)) else
+                        datetime.now(timezone.utc).isoformat()
+                    )
+                    self.simulated_taker_trades.append({
+                        'timestamp': ts_iso,
+                        'side': 'BUY',
+                        'requested_size': float(target),
+                        'filled_size': float(filled),
+                        'vwap': float(vwap),
+                        'slippage_vs_best': float(slippage_best) if slippage_best is not None else None,
+                        'slippage_vs_mid': float(slippage_mid) if slippage_mid is not None else None,
+                        'levels_touched': int(len(levels))
+                    })
+                    self.simulated_fills.append({
+                        'timestamp': ts_iso,
+                        'side': 'BUY',
+                        'price': float(vwap),
+                        'size': float(filled),
+                        'order_id': None,
+                        'equity': self.total_value,
+                        'inventory': self.inventory_position,
+                        'cash': self.cash,
+                        'exec_type': 'AGGRESSIVE_SWEEP'
+                    })
 
                     logger.info(
                         "Aggressive BUY: filled %.2f (VWAP %.4f) | slip_best=%.5f slip_mid=%.5f | levels=%d",

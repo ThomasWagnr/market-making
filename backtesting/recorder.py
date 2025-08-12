@@ -90,7 +90,7 @@ class MarketRecorder:
                 break
             except Exception as e:
                 if not shutdown_event.is_set():
-                    self.logger.error("An error occurred: %s. Retrying in %d s...", e, current_retry_delay)
+                    logger.error("An error occurred: %s. Retrying in %d s...", e, current_retry_delay)
                     await asyncio.sleep(current_retry_delay)
                     current_retry_delay = min(self.max_retry_delay, current_retry_delay * self.retry_multiplier)
         
