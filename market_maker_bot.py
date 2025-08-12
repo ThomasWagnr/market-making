@@ -317,12 +317,16 @@ class MarketMakerBot:
         # Pass along sim_time if present for consistent timestamps
         sim_time = trade.get('sim_time')
 
-        if asset_id == self.yes_token_id:
-            equivalent_yes_price = trade_price
-        elif asset_id == self.no_token_id:
-            equivalent_yes_price = 1.0 - trade_price
+        # Prefer pre-normalized price if provided
+        if 'equivalent_yes_price' in trade:
+            equivalent_yes_price = float(trade['equivalent_yes_price'])
         else:
-            return
+            if asset_id == self.yes_token_id:
+                equivalent_yes_price = trade_price
+            elif asset_id == self.no_token_id:
+                equivalent_yes_price = 1.0 - trade_price
+            else:
+                return
 
         # --- Check for Bid Fills (Our Buy Orders) ---
         # Sort by price to process the best-priced orders first

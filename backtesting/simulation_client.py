@@ -11,10 +11,6 @@ logger = logging.getLogger(__name__)
 class SimulatedExchange(ExecutionClient):
     """
     A simulated execution client for backtesting.
-
-    Unified matching: this client does NOT implement its own matching or queue logic.
-    It simply logs orders and forwards trade events to the bot's fill checker, which
-    is the single source of truth for queue priority and fills.
     """
     def __init__(self, orders_list: List[Dict[str, Any]]):
         self.simulated_orders_log = orders_list
