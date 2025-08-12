@@ -163,6 +163,34 @@ def generate_performance_report(
             oss_df.sort_values('timestamp', inplace=True)
             oss_df.to_csv(os.path.join(output_dir, 'order_state_snapshots.csv'), index=False)
 
+        # Derive and save book snapshots with our overlay if possible
+        if book_snapshots and order_state_snapshots:
+            try:
+                book_df = pd.DataFrame(book_snapshots).copy()
+                book_df['timestamp'] = pd.to_datetime(book_df['timestamp'], unit='s', errors='coerce')
+                oss_df = pd.DataFrame(order_state_snapshots).copy()
+                oss_df['timestamp'] = pd.to_datetime(oss_df['timestamp'], unit='s', errors='coerce')
+                # Aggregate our displayed size per timestamp, side, and price
+                agg = (
+                    oss_df.groupby(['timestamp', 'side', 'price'])['size']
+                          .sum()
+                          .reset_index()
+                )
+                # Compute overlay best bid/ask per timestamp
+                bids = agg[agg['side'] == 'BUY']
+                asks = agg[agg['side'] == 'SELL']
+                best_bid_overlay = bids.groupby('timestamp').apply(lambda g: g.loc[g['price'].idxmax()]) if not bids.empty else None
+                best_ask_overlay = asks.groupby('timestamp').apply(lambda g: g.loc[g['price'].idxmin()]) if not asks.empty else None
+                # Merge into book_df to get a simple indicative book-with-overlay bests
+                out = book_df.copy()
+                if best_bid_overlay is not None and not isinstance(best_bid_overlay, list):
+                    out = out.merge(best_bid_overlay[['timestamp', 'price', 'size']].rename(columns={'price': 'overlay_best_bid', 'size': 'overlay_bid_size'}), on='timestamp', how='left')
+                if best_ask_overlay is not None and not isinstance(best_ask_overlay, list):
+                    out = out.merge(best_ask_overlay[['timestamp', 'price', 'size']].rename(columns={'price': 'overlay_best_ask', 'size': 'overlay_ask_size'}), on='timestamp', how='left')
+                out.to_csv(os.path.join(output_dir, 'book_snapshots_with_overlay.csv'), index=False)
+            except Exception:
+                pass
+
         # Derive and save aggressive trade summary if fills include shutdown sweeps
         if 'equity' in fills_df.columns and 'order_id' in fills_df.columns:
             # Heuristic placeholder: in future, tag aggressive events explicitly

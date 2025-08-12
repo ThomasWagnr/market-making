@@ -12,7 +12,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 
 import aiohttp
 import websockets
-from utils import get_market_tokens
+from utils import get_market_details
 
 # --- Configuration & Logging Setup ---
 WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
@@ -48,11 +48,11 @@ class MarketRecorder:
         """Starts the recording process and runs until shutdown is signaled."""
         logger.info(f"[{self.market_id}] Initializing recorder task...")
         
-        tokens = await get_market_tokens(self.session, self.market_id)
-        if not tokens:
+        details = await get_market_details(self.session, self.market_id)
+        if not details:
             logger.error(f"[{self.market_id}] Could not get token IDs. Aborting this recorder task.")
             return
-        self.token_ids = list(tokens)
+        self.token_ids = [details['yes_token_id'], details['no_token_id']]
 
         current_retry_delay = self.initial_retry_delay
 

@@ -91,6 +91,9 @@ class MarketMakerBot:
         # Better volume caches per our active price
         self._better_vol_at_bid_price: Dict[float, float] = {}
         self._better_vol_at_ask_price: Dict[float, float] = {}
+        # Display overlay of our posted sizes (for visualization only)
+        self._overlay_bids_by_price: Dict[float, float] = {}
+        self._overlay_asks_by_price: Dict[float, float] = {}
 
     def _on_update(self, event_type: str, data: dict):
         """Core trigger, called by the dispatcher after any data update."""
@@ -240,6 +243,7 @@ class MarketMakerBot:
                     price = self.active_bids[order_id]['price']
                     remaining = self.active_bids[order_id]['size']
                     self._our_bids_by_price[price] = max(0.0, self._our_bids_by_price.get(price, 0.0) - remaining)
+                    self._overlay_bids_by_price[price] = max(0.0, self._overlay_bids_by_price.get(price, 0.0) - remaining)
                 self._cancel_order(order_id)
                 if order_id in self.active_bids: del self.active_bids[order_id]
         
@@ -269,6 +273,7 @@ class MarketMakerBot:
                     }
                     # Update caches for incremental refresh
                     self._our_bids_by_price[price] = self._our_bids_by_price.get(price, 0.0) + size
+                    self._overlay_bids_by_price[price] = self._overlay_bids_by_price.get(price, 0.0) + size
                     if price not in self._better_vol_at_bid_price:
                         self._better_vol_at_bid_price[price] = better_vol
                     self._book_bids_size[price] = book_at_price
@@ -291,6 +296,7 @@ class MarketMakerBot:
                     price = self.active_asks[order_id]['price']
                     remaining = self.active_asks[order_id]['size']
                     self._our_asks_by_price[price] = max(0.0, self._our_asks_by_price.get(price, 0.0) - remaining)
+                    self._overlay_asks_by_price[price] = max(0.0, self._overlay_asks_by_price.get(price, 0.0) - remaining)
                 self._cancel_order(order_id)
                 if order_id in self.active_asks: del self.active_asks[order_id]
 
@@ -316,6 +322,7 @@ class MarketMakerBot:
                         'baseline_our_prior_vol': our_prior_vol,
                     }
                     self._our_asks_by_price[price] = self._our_asks_by_price.get(price, 0.0) + size
+                    self._overlay_asks_by_price[price] = self._overlay_asks_by_price.get(price, 0.0) + size
                     if price not in self._better_vol_at_ask_price:
                         self._better_vol_at_ask_price[price] = better_vol
                     self._book_asks_size[price] = book_at_price
@@ -425,6 +432,13 @@ class MarketMakerBot:
             active_order_book[order_id]['volume_ahead'] = 0.0
             if active_order_book[order_id]['size'] <= 1e-9:
                 del active_order_book[order_id]
+
+        # Reduce our overlay displayed size at this price (visualization only)
+        price_key = price
+        if side == 'BUY':
+            self._overlay_bids_by_price[price_key] = max(0.0, self._overlay_bids_by_price.get(price_key, 0.0) - size)
+        else:
+            self._overlay_asks_by_price[price_key] = max(0.0, self._overlay_asks_by_price.get(price_key, 0.0) - size)
         
         if abs(self.inventory_position) < 1e-9:
             self.average_entry_price = 0.0
