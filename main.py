@@ -9,6 +9,7 @@ from typing import List, Dict, Any
 from market_maker_bot import MarketMakerBot
 from strategies.avellaneda_stoikov import AvellanedaStoikovStrategy
 from execution_client import DryRunExecutionClient
+from config import load_config
 
 logger = logging.getLogger(__name__)
 
@@ -55,24 +56,9 @@ def main():
     )
     logging.getLogger('websockets').setLevel(logging.WARNING)
 
-    # --- 1. Choose and Configure the Strategy ---
-    strategy = AvellanedaStoikovStrategy(
-        gamma=10.0,
-        lookback_period=20,
-        ewma_span=20,
-        enable_trend_skew=True,
-        enable_layering=True,
-        k_scaling_factor=10.0,
-        max_skew=0.005,
-        layer_price_step=1,
-        layer_size_ratio=1.5,
-        max_layers=3,
-        max_size_tolerance_pct=0.80,
-        min_size_tolerance_pct=0.20,
-        patience_depth_factor=0.8,
-        book_depth_ma_window=100,
-        liquidity_fraction=0.7
-    )
+    # --- 1. Load configuration and configure the Strategy/Bot ---
+    config = load_config()
+    strategy = AvellanedaStoikovStrategy(**config.get('strategy', {}))
 
     simulated_orders_list = []
     simulated_fills_list = []
@@ -85,10 +71,8 @@ def main():
         market_id=market_id,
         strategy=strategy,
         execution_client=execution_client,
-        total_capital=2000.0,
-        order_value_percentage=0.05,
-        minting_capital_fraction=0.5,
-        simulated_fills=simulated_fills_list
+        simulated_fills=simulated_fills_list,
+        **config.get('bot', {})
     )
 
     try:

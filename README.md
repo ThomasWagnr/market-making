@@ -39,9 +39,22 @@ Outputs
 - Logs: `logs/bot_run_<market_id>_<timestamp>.log`
 - CSVs at shutdown: `simulated_orders_<ts>.csv`, `simulated_fills_<ts>.csv`, `market_trades_<ts>.csv`
 
-Tunable knobs for the live run are in `main.py`:
-- Strategy params (e.g., `gamma`, `enable_layering`, `k_scaling_factor`)
-- Bot params (`total_capital`, `order_value_percentage`, `minting_capital_fraction`)
+Configuration is loaded from `config.json` (see Configuration below). If a key is omitted or set to null, the code's constructor defaults are used.
+
+### Configuration
+
+- **Initialize** a local config from the template (kept out of Git):
+```bash
+cp config.example.json config.json
+```
+- **Edit** `config.json` and fill values under `strategy` and `bot`. Any missing or `null` values will fall back to the in-code defaults in `AvellanedaStoikovStrategy` and `MarketMakerBot`.
+- **Optional custom path** using an environment variable:
+```bash
+BOT_CONFIG_PATH=/absolute/path/to/my-config.json python main.py <market_id>
+# or for backtests
+BOT_CONFIG_PATH=/absolute/path/to/my-config.json python backtesting/backtest.py backtesting/data/<file>.jsonl.gz
+```
+- `config.json` is listed in `.gitignore`, so your local settings remain private. Share `config.example.json` for team defaults.
 
 
 ### 3) Record Historical Data (Optional)
@@ -67,7 +80,7 @@ python backtesting/backtest.py backtesting/data/market_data_0xab6faa3e66abacc484
 
 Notes
 - The script parses the `market_id` automatically from the filename (first `0x...` token).
-- Strategy and bot configuration for backtests are defined at the bottom of `backtesting/backtest.py`.
+- Backtests also read configuration via `config.json` (or `BOT_CONFIG_PATH`). No code edits required to tune params.
 - A performance report (trades, P&L, inventory) prints to the console at the end.
 
 

@@ -1,0 +1,29 @@
+{
+  "strategy": {
+    "gamma": null,
+    "lookback_period": null,
+    "ewma_span": null,
+    "enable_trend_skew": null,
+    "enable_layering": null,
+    "trend_window": null,
+    "max_skew": null,
+    "k_scaling_factor": null,
+    "layer_price_step": null,
+    "layer_size_ratio": null,
+    "max_layers": null,
+    "max_size_tolerance_pct": null,
+    "min_size_tolerance_pct": null,
+    "patience_depth_factor": null,
+    "book_depth_ma_window": null,
+    "liquidity_fraction": null,
+    "lookback_window_seconds": null,
+    "ewma_halflife_seconds": null
+  },
+  "bot": {
+    "total_capital": null,
+    "minting_capital_fraction": null,
+    "order_value_percentage": null
+  }
+}
+
+

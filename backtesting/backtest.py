@@ -19,6 +19,7 @@ from utils import get_market_details
 from event_dispatcher import EventDispatcher
 from order_book import OrderBook
 from trade_history import TradeHistory
+from config import load_config
 
 # Configure logging for the backtest
 logging.basicConfig(
@@ -147,32 +148,10 @@ if __name__ == '__main__':
         print("Please ensure filename follows the 'market_data_MARKETID_...' format.")
         sys.exit(1)
 
-    # --- Define the parameters for this specific backtest run ---
-    # These are the knobs you will tune to optimize your strategy
-    strategy_config = {
-        'gamma': 10.0,
-        'lookback_period': 20,
-        'ewma_span': 20,
-        'enable_trend_skew': True,
-        'enable_layering': True,
-        'trend_window': 20,
-        'max_skew': 0.005,
-        'k_scaling_factor': 10.0,
-        'layer_price_step': 1,
-        'layer_size_ratio': 1.5,
-        'max_layers': 3,
-        'max_size_tolerance_pct': 0.80,
-        'min_size_tolerance_pct': 0.20,
-        'patience_depth_factor': 0.8,
-        'book_depth_ma_window': 100,
-        'liquidity_fraction': 0.7
-    }
-    
-    bot_config = {
-        'total_capital': 2000.0,
-        'minting_capital_fraction': 0.5,
-        'order_value_percentage': 0.05
-    }
+    # --- Load parameters from config file ---
+    config = load_config()
+    strategy_config = config.get('strategy', {})
+    bot_config = config.get('bot', {})
     
     # Run the backtest
     asyncio.run(run_backtest(
