@@ -214,7 +214,8 @@ class AvellanedaStoikovStrategy(BaseStrategy):
         return quotes
     
     def calculate_quotes(self, order_book: OrderBook, inventory_position: float, 
-                         time_horizon: float, total_bid_size: float, total_ask_size: float) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+                         time_horizon: float, total_bid_size: float, total_ask_size: float,
+                         current_time=None) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         mid_price = order_book.mid_price
         if mid_price is None:
             return [], []
@@ -225,7 +226,12 @@ class AvellanedaStoikovStrategy(BaseStrategy):
             return [], []
 
         # Build a time-indexed series for EWMA vol (time-based, not event-based)
-        now = datetime.now(timezone.utc)
+        if isinstance(current_time, (int, float)):
+            now = datetime.fromtimestamp(current_time, tz=timezone.utc)
+        elif isinstance(current_time, datetime):
+            now = current_time
+        else:
+            now = datetime.now(timezone.utc)
         self.mid_price_time_history.append((now, mid_price))
         # Prune to lookback window
         cutoff = now.timestamp() - float(self.lookback_window_seconds)

@@ -54,8 +54,6 @@ BOT_CONFIG_PATH=/absolute/path/to/my-config.json python main.py <market_id>
 # or for backtests
 BOT_CONFIG_PATH=/absolute/path/to/my-config.json python backtesting/backtest.py backtesting/data/<file>.jsonl.gz
 ```
-- `config.json` is listed in `.gitignore`, so your local settings remain private. Share `config.example.json` for team defaults.
-
 
 ### 3) Record Historical Data (Optional)
 Record multiple markets from the live feed to build JSONL.GZ datasets for backtesting.

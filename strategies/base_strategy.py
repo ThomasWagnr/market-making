@@ -13,6 +13,7 @@ class BaseStrategy(ABC):
         time_horizon: float,
         total_bid_size: float,
         total_ask_size: float,
+        current_time=None,
     ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         """
         Calculates the bid and ask quotes the bot should place.

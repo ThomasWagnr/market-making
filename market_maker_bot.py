@@ -116,7 +116,8 @@ class MarketMakerBot:
             inventory_position=self.inventory_position,
             time_horizon=self.time_horizon,
             total_bid_size=total_bid_size,
-            total_ask_size=total_ask_size
+            total_ask_size=total_ask_size,
+            current_time=data.get('sim_time') if isinstance(data, dict) else None
         )
 
         state_str = (f"{self.order_book} | Inv: {self.inventory_position:+.1f} | "
@@ -313,6 +314,8 @@ class MarketMakerBot:
         if not asset_id: return
         trade_price = float(trade['price'])
         remaining_trade_size = float(trade['size'])
+        # Pass along sim_time if present for consistent timestamps
+        sim_time = trade.get('sim_time')
 
         if asset_id == self.yes_token_id:
             equivalent_yes_price = trade_price
@@ -340,7 +343,7 @@ class MarketMakerBot:
                 # If we are at the front of the queue, we can get filled
                 if order['volume_ahead'] <= 1e-9:
                     fill_size = min(remaining_trade_size, order['size'])
-                    self._process_fill('BUY', order['price'], fill_size, order_id)
+                    self._process_fill('BUY', order['price'], fill_size, order_id, sim_time)
 
         # --- Symmetrical Logic for Ask Fills (Our Sell Orders) ---
         sorted_ask_ids = sorted(self.active_asks, key=lambda oid: self.active_asks[oid]['price'])
@@ -358,14 +361,17 @@ class MarketMakerBot:
                 
                 if order['volume_ahead'] <= 1e-9:
                     fill_size = min(remaining_trade_size, order['size'])
-                    self._process_fill('SELL', order['price'], fill_size, order_id)
+                    self._process_fill('SELL', order['price'], fill_size, order_id, sim_time)
 
-    def _process_fill(self, side: str, price: float, size: float, order_id: int):
+    def _process_fill(self, side: str, price: float, size: float, order_id: int, sim_time=None):
         """Processes a single fill, updating inventory, P&L, and active orders."""
-        self.simulated_fills.append({
-            'timestamp': datetime.now(timezone.utc).isoformat(),
-            'side': side, 'price': price, 'size': size
-        })
+        # Normalize timestamp: prefer simulated time from data, else now
+        if isinstance(sim_time, (int, float)):
+            ts_iso = datetime.fromtimestamp(sim_time, tz=timezone.utc).isoformat()
+        elif isinstance(sim_time, str):
+            ts_iso = sim_time
+        else:
+            ts_iso = datetime.now(timezone.utc).isoformat()
 
         if side == 'BUY':
             active_order_book = self.active_bids
@@ -403,6 +409,19 @@ class MarketMakerBot:
         
         if abs(self.inventory_position) < 1e-9:
             self.average_entry_price = 0.0
+
+        # Update PnL after state changes and record enriched fill log
+        self._update_pnl()
+        self.simulated_fills.append({
+            'timestamp': ts_iso,
+            'side': side,
+            'price': price,
+            'size': size,
+            'order_id': order_id,
+            'equity': self.total_value,
+            'inventory': self.inventory_position,
+            'cash': self.cash
+        })
 
         logger.info(f"FILL: {side} {size:.2f} @ {price:.3f}. New Inventory: {self.inventory_position:+.1f}")
 
