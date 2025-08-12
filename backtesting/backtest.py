@@ -38,6 +38,8 @@ async def run_backtest(data_filepath: str, market_id: str, strategy_params: Dict
     # 1. Initialize all components for the simulation
     simulated_orders = []
     simulated_fills = []
+    book_snapshots = []
+    order_state_snapshots = []
     
     strategy = AvellanedaStoikovStrategy(**strategy_params)
     sim_exchange = SimulatedExchange(orders_list=simulated_orders)
@@ -90,12 +92,46 @@ async def run_backtest(data_filepath: str, market_id: str, strategy_params: Dict
                 
                 # Before the bot reacts, the exchange must process any trades from the message
                 for event in events:
+                    # Attach simulated time to every event
+                    event["sim_time"] = timestamp
                     if event.get("event_type") == "last_trade_price":
                         sim_exchange.check_for_fills(event, bot._check_fills)
                 
                 # Now, dispatch the message to update the bot's view of the world (order book)
                 # and trigger its strategy logic (_on_update).
                 bot.dispatcher.dispatch(json.dumps(events))
+
+                # After bot updates, snapshot the current book and our active orders
+                try:
+                    book_snapshots.append({
+                        'timestamp': timestamp,
+                        'best_bid': bot.order_book.best_bid if bot.order_book else None,
+                        'best_ask': bot.order_book.best_ask if bot.order_book else None,
+                        'mid_price': bot.order_book.mid_price if bot.order_book else None,
+                        'spread': bot.order_book.spread if bot.order_book else None,
+                    })
+                    # Active bids
+                    for oid, o in bot.active_bids.items():
+                        order_state_snapshots.append({
+                            'timestamp': timestamp,
+                            'order_id': oid,
+                            'side': 'BUY',
+                            'price': o.get('price'),
+                            'size': o.get('size'),
+                            'volume_ahead': o.get('volume_ahead'),
+                        })
+                    # Active asks
+                    for oid, o in bot.active_asks.items():
+                        order_state_snapshots.append({
+                            'timestamp': timestamp,
+                            'order_id': oid,
+                            'side': 'SELL',
+                            'price': o.get('price'),
+                            'size': o.get('size'),
+                            'volume_ahead': o.get('volume_ahead'),
+                        })
+                except Exception:
+                    pass
                 
                 message_count += 1
                 if message_count % 10000 == 0:
@@ -117,7 +153,16 @@ async def run_backtest(data_filepath: str, market_id: str, strategy_params: Dict
         'total_value': bot.total_value,
         'inventory_position': bot.inventory_position
     }
-    generate_performance_report(bot_final_state, simulated_fills)
+    # Create a default output directory name next to data file
+    output_dir = os.path.join(os.path.dirname(data_filepath), f"report_{os.path.basename(data_filepath).replace('.jsonl.gz','')}")
+    generate_performance_report(
+        bot_final_state,
+        simulated_fills,
+        orders_log=simulated_orders,
+        output_dir=output_dir,
+        book_snapshots=book_snapshots,
+        order_state_snapshots=order_state_snapshots,
+    )
 
 
 if __name__ == '__main__':
